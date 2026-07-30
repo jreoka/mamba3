@@ -92,9 +92,11 @@ The bundled kernel fuses the selective recurrence, skip connection, and SiLU
 gate into one launch. It uses one CUDA thread per batch/channel recurrence,
 register-resident state, compile-time specializations for state sizes up to 64,
 FP32 state accumulation, coalesced sequence I/O, and a separate handwritten
-reverse recurrence for gradients. Inference avoids allocating the training state
-history. The Python reference implementation is automatically used on CPU or if
-the local CUDA toolchain cannot compile the extension.
+reverse recurrence for gradients. Training stores sparse recurrent checkpoints
+and exactly recomputes short chunks in shared memory during the reverse pass
+instead of retaining an `[batch, length, channels, d_state]` history. The Python
+reference implementation is automatically used on CPU or if the local CUDA
+toolchain cannot compile the extension.
 
 You can precompile the lazy extension explicitly:
 
@@ -113,6 +115,8 @@ Environment controls:
 
 ```bash
 python benchmarks/benchmark_scan.py --batch 8 --length 2048 --channels 512 --state 16
+python benchmarks/benchmark_scan.py --training --dtype bfloat16 \
+  --batch 16 --length 512 --channels 512 --state 16
 ```
 
 Performance depends heavily on GPU, CUDA/PyTorch versions, shapes, dtype, and
@@ -128,10 +132,10 @@ for other systems.
 
 - `d_state` can be 1 through 64; 8, 16, 32, and 64 map directly to kernel
   specializations.
-- The fused kernel accepts FP16/BF16 model inputs but keeps the recurrent state
-  and its gradient accumulation in FP32 for stability.
-- Training saves recurrent states for an exact O(sequence length) backward pass.
-  Inference does not allocate that history.
+- The fused kernel reads and writes FP16/BF16 activations directly while keeping
+  the recurrent state and shared gradient accumulation in FP32 for stability.
+- For the common `d_state=16`, training stores one recurrent checkpoint per
+  eight sequence positions; inference stores no sequence-length state history.
 - Non-causal mode runs both sequence directions and therefore costs roughly twice
   as much scan work as causal mode.
 

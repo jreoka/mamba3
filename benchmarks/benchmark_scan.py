@@ -32,6 +32,8 @@ def main() -> None:
     parser.add_argument("--channels", type=int, default=512)
     parser.add_argument("--state", type=int, default=16)
     parser.add_argument("--iterations", type=int, default=50)
+    parser.add_argument("--training", action="store_true")
+    parser.add_argument("--dtype", choices=("float32", "float16", "bfloat16"), default="bfloat16")
     args = parser.parse_args()
     if not torch.cuda.is_available():
         raise SystemExit("CUDA is required for this benchmark")
@@ -39,22 +41,35 @@ def main() -> None:
         raise SystemExit("CUDA extension could not be built")
 
     device = "cuda"
-    x = torch.randn(args.batch, args.length, args.channels, device=device)
+    dtype = getattr(torch, args.dtype)
+    x = torch.randn(args.batch, args.length, args.channels, device=device, dtype=dtype)
     dt = torch.rand_like(x) * 0.05
     A = -torch.rand(args.channels, args.state, device=device)
-    B = torch.randn(args.batch, args.length, args.state, device=device)
+    B = torch.randn(args.batch, args.length, args.state, device=device, dtype=dtype)
     C = torch.randn_like(B)
     D = torch.ones(args.channels, device=device)
     z = torch.randn_like(x)
+    values = (x, dt, A, B, C, D, z)
+    if args.training:
+        values = tuple(value.detach().requires_grad_(True) for value in values)
 
     def fused():
-        selective_scan(x, dt, A, B, C, D, z, use_cuda_kernel=True)
+        y = selective_scan(*values, use_cuda_kernel=True)
+        if args.training:
+            y.float().square().mean().backward()
+            for value in values:
+                value.grad = None
 
+    torch.cuda.reset_peak_memory_stats()
+    base_memory = torch.cuda.memory_allocated()
     latency = elapsed_ms(fused, warmup=10, iterations=args.iterations)
     tokens = args.batch * args.length
     print(f"device: {torch.cuda.get_device_name()}")
     print(f"shape: B={args.batch}, L={args.length}, H={args.channels}, N={args.state}")
+    print(f"mode/dtype: {'training' if args.training else 'inference'} / {args.dtype}")
     print(f"fused scan: {latency:.3f} ms ({tokens / (latency / 1000):,.0f} tokens/s)")
+    peak_memory = torch.cuda.max_memory_allocated() - base_memory
+    print(f"peak incremental memory: {peak_memory / (1024 ** 2):.1f} MiB")
 
 
 if __name__ == "__main__":

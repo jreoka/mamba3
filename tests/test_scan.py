@@ -65,3 +65,70 @@ def test_cuda_matches_reference_forward_and_backward() -> None:
     (y_ref * weights).sum().add((state_ref * state_weights).sum()).backward()
     for cuda_value, reference_value in zip(cuda_values, reference_values):
         torch.testing.assert_close(cuda_value.grad, reference_value.grad, rtol=1e-3, atol=2e-4)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+@pytest.mark.parametrize(
+    ("dtype", "rtol", "atol"),
+    ((torch.float16, 5e-3, 5e-4), (torch.bfloat16, 2e-2, 2e-3)),
+)
+def test_cuda_mixed_precision_matches_reference(
+    dtype: torch.dtype,
+    rtol: float,
+    atol: float,
+) -> None:
+    if load_cuda_extension() is None:
+        pytest.skip("mamba3 CUDA extension did not compile")
+
+    cuda_values = make_inputs("cuda", requires_grad=True)
+    cuda_values = tuple(
+        value.detach().to(dtype).requires_grad_(True)
+        if index not in (2, 5, 7)
+        else value
+        for index, value in enumerate(cuda_values)
+    )
+    reference_values = tuple(value.detach().clone().requires_grad_(True) for value in cuda_values)
+    y_cuda, state_cuda = run(cuda_values, use_cuda_kernel=True)
+    y_ref, state_ref = run(reference_values, use_cuda_kernel=False)
+    assert y_cuda.dtype == dtype
+    assert state_cuda.dtype == torch.float32
+    torch.testing.assert_close(y_cuda, y_ref, rtol=rtol, atol=atol)
+    torch.testing.assert_close(state_cuda, state_ref, rtol=1e-3, atol=2e-4)
+
+    weights = torch.randn_like(y_cuda)
+    state_weights = torch.randn_like(state_cuda)
+    (y_cuda * weights).sum().add((state_cuda * state_weights).sum()).backward()
+    (y_ref * weights).sum().add((state_ref * state_weights).sum()).backward()
+    for cuda_value, reference_value in zip(cuda_values, reference_values):
+        torch.testing.assert_close(cuda_value.grad, reference_value.grad, rtol=rtol, atol=atol)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_cuda_long_sequence_gradients_are_stable() -> None:
+    if load_cuda_extension() is None:
+        pytest.skip("mamba3 CUDA extension did not compile")
+
+    torch.manual_seed(123)
+    batch, length, channels, state = 1, 257, 5, 16
+    cuda_values = (
+        torch.randn(batch, length, channels, device="cuda") * 0.2,
+        torch.rand(batch, length, channels, device="cuda") * 0.099 + 0.001,
+        -torch.arange(1, state + 1, device="cuda").float().repeat(channels, 1),
+        torch.randn(batch, length, state, device="cuda") * 0.2,
+        torch.randn(batch, length, state, device="cuda") * 0.2,
+        torch.randn(channels, device="cuda") * 0.2,
+        torch.randn(batch, length, channels, device="cuda") * 0.2,
+        torch.zeros(batch, channels, state, device="cuda"),
+    )
+    cuda_values = tuple(value.requires_grad_(True) for value in cuda_values)
+    reference_values = tuple(value.detach().clone().requires_grad_(True) for value in cuda_values)
+    y_cuda, state_cuda = run(cuda_values, use_cuda_kernel=True)
+    y_ref, state_ref = run(reference_values, use_cuda_kernel=False)
+    weights = torch.randn_like(y_cuda)
+    state_weights = torch.randn_like(state_cuda)
+    (y_cuda * weights).sum().add((state_cuda * state_weights).sum()).backward()
+    (y_ref * weights).sum().add((state_ref * state_weights).sum()).backward()
+
+    for cuda_value, reference_value in zip(cuda_values, reference_values):
+        assert torch.isfinite(cuda_value.grad).all()
+        torch.testing.assert_close(cuda_value.grad, reference_value.grad, rtol=2e-3, atol=3e-4)

@@ -17,8 +17,15 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        normalized = x.float() * torch.rsqrt(x.float().pow(2).mean(-1, keepdim=True) + self.eps)
-        return (normalized * self.weight.float()).to(x.dtype)
+        # Matching the weight dtype enables PyTorch's fused RMSNorm path. The
+        # previous implementation materialized the full activation in FP32
+        # twice, which was especially expensive for long BF16 audio sequences.
+        return F.rms_norm(
+            x,
+            (x.shape[-1],),
+            self.weight.to(dtype=x.dtype),
+            self.eps,
+        )
 
 
 class Mamba3Block(nn.Module):

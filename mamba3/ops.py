@@ -46,7 +46,7 @@ def load_cuda_extension(verbose: bool = False) -> Any | None:
         if os.name == "nt":
             cuda_flags.append("-Xcompiler=/Zc:preprocessor")
         return load(
-            name="mamba3_cuda_v1",
+            name="mamba3_cuda_v4",
             sources=[str(root / "scan.cpp"), str(root / "scan_cuda.cu")],
             extra_cflags=cxx_flags,
             extra_cuda_cflags=cuda_flags,
@@ -136,22 +136,26 @@ def _reference_scan(
 class _SelectiveScanCuda(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, dt, A, B, C, D, z, initial_state, extension):
-        tensors = [tensor.contiguous().float() for tensor in (x, dt, A, B, C, D, z, initial_state)]
-        y, states, final_state = extension.forward(*tensors, True)
+        tensors = (x, dt, A, B, C, D, z, initial_state)
+        # Save sparse recurrent checkpoints rather than the full [B, L, H, N]
+        # history. The backward kernel exactly recomputes each short chunk in
+        # shared memory, avoiding both the large allocation and unstable reverse
+        # inversion of the recurrence.
+        y, state_checkpoints, final_state = extension.forward(*tensors, True)
         ctx.extension = extension
-        ctx.input_dtypes = tuple(tensor.dtype for tensor in (x, dt, A, B, C, D, z, initial_state))
-        ctx.save_for_backward(*tensors, states)
+        ctx.input_dtypes = tuple(tensor.dtype for tensor in tensors)
+        ctx.save_for_backward(*tensors, state_checkpoints)
         return y.to(x.dtype), final_state
 
     @staticmethod
     def backward(ctx, grad_y, grad_final_state):
-        x, dt, A, B, C, D, z, initial_state, states = ctx.saved_tensors
+        x, dt, A, B, C, D, z, initial_state, state_checkpoints = ctx.saved_tensors
         if grad_y is None:
             grad_y = torch.zeros_like(x)
         if grad_final_state is None:
             grad_final_state = torch.zeros_like(initial_state)
         grads = ctx.extension.backward(
-            grad_y.contiguous().float(),
+            grad_y.to(dtype=x.dtype).contiguous(),
             grad_final_state.contiguous().float(),
             x,
             dt,
@@ -161,10 +165,39 @@ class _SelectiveScanCuda(torch.autograd.Function):
             D,
             z,
             initial_state,
-            states,
+            state_checkpoints,
         )
         cast_grads = tuple(grad.to(dtype) for grad, dtype in zip(grads, ctx.input_dtypes))
         return (*cast_grads, None)
+
+
+def _prepare_cuda_inputs(
+    x: torch.Tensor,
+    dt: torch.Tensor,
+    A: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor,
+    D: torch.Tensor,
+    z: torch.Tensor,
+    initial_state: torch.Tensor,
+) -> tuple[torch.Tensor, ...]:
+    """Normalize CUDA kernel dtypes without expanding mixed-precision activations."""
+
+    activation_dtype = (
+        x.dtype
+        if x.dtype in (torch.float16, torch.bfloat16, torch.float32)
+        else torch.float32
+    )
+    return (
+        x.to(dtype=activation_dtype).contiguous(),
+        dt.to(dtype=activation_dtype).contiguous(),
+        A.float().contiguous(),
+        B.to(dtype=activation_dtype).contiguous(),
+        C.to(dtype=activation_dtype).contiguous(),
+        D.float().contiguous(),
+        z.to(dtype=activation_dtype).contiguous(),
+        initial_state.float().contiguous(),
+    )
 
 
 def selective_scan(
@@ -194,20 +227,17 @@ def selective_scan(
 
     extension = load_cuda_extension() if use_cuda_kernel and x.is_cuda else None
     if extension is not None:
+        kernel_tensors = _prepare_cuda_inputs(x, dt, A, B, C, D, z, initial_state)
         needs_backward = torch.is_grad_enabled() and any(
             tensor.requires_grad for tensor in (x, dt, A, B, C, D, z, initial_state)
         )
         if needs_backward:
             y, final_state = _SelectiveScanCuda.apply(
-                x, dt, A, B, C, D, z, initial_state, extension
+                *kernel_tensors, extension
             )
         else:
-            tensors = [
-                tensor.contiguous().float()
-                for tensor in (x, dt, A, B, C, D, z, initial_state)
-            ]
-            y, _, final_state = extension.forward(*tensors, False)
-            y = y.to(x.dtype)
+            y, _, final_state = extension.forward(*kernel_tensors, False)
+        y = y.to(x.dtype)
     else:
         y, final_state = _reference_scan(x, dt, A, B, C, D, z, initial_state)
     return (y, final_state) if return_state else y

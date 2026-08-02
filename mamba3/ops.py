@@ -136,36 +136,66 @@ def _reference_scan(
 class _SelectiveScanCuda(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, dt, A, B, C, D, z, initial_state, extension):
-        tensors = (x, dt, A, B, C, D, z, initial_state)
-        # Save sparse recurrent checkpoints rather than the full [B, L, H, N]
-        # history. The backward kernel exactly recomputes each short chunk in
-        # shared memory, avoiding both the large allocation and unstable reverse
-        # inversion of the recurrence.
-        y, state_checkpoints, final_state = extension.forward(*tensors, True)
+        # The kernels scan sequence positions in parallel, so they want the
+        # channel-major layouts [B, H, L] for x/dt/z/y and [B, N, L] for B/C.
+        # The fused transposes are cheap GPU copies; doing them inside this
+        # function keeps the whole scan a single autograd node.
+        kernel_tensors = (
+            extension.transpose(x),
+            extension.transpose(dt),
+            A,
+            extension.transpose(B),
+            extension.transpose(C),
+            D,
+            extension.transpose(z),
+            initial_state,
+        )
+        # Save sparse recurrent checkpoints (one (decay, state) pair per chunk)
+        # rather than the full [B, L, H, N] history. The backward kernels
+        # exactly recompute each short chunk, avoiding both the large
+        # allocation and unstable reverse inversion of the recurrence.
+        y_t, state_checkpoints, final_state = extension.forward(*kernel_tensors, True)
+        y = extension.transpose(y_t)
         ctx.extension = extension
-        ctx.input_dtypes = tuple(tensor.dtype for tensor in tensors)
-        ctx.save_for_backward(*tensors, state_checkpoints)
+        ctx.input_dtypes = tuple(tensor.dtype for tensor in (x, dt, A, B, C, D, z, initial_state))
+        ctx.save_for_backward(*kernel_tensors, state_checkpoints)
         return y.to(x.dtype), final_state
 
     @staticmethod
     def backward(ctx, grad_y, grad_final_state):
-        x, dt, A, B, C, D, z, initial_state, state_checkpoints = ctx.saved_tensors
+        x_t, dt_t, A, B_t, C_t, D, z_t, initial_state, state_checkpoints = ctx.saved_tensors
+        extension = ctx.extension
         if grad_y is None:
-            grad_y = torch.zeros_like(x)
+            grad_y = torch.zeros_like(x_t)
+        else:
+            grad_y = extension.transpose(grad_y.contiguous())
         if grad_final_state is None:
             grad_final_state = torch.zeros_like(initial_state)
-        grads = ctx.extension.backward(
-            grad_y.to(dtype=x.dtype).contiguous(),
+        grads = extension.backward(
+            grad_y.to(dtype=x_t.dtype).contiguous(),
             grad_final_state.contiguous().float(),
-            x,
-            dt,
+            x_t,
+            dt_t,
             A,
-            B,
-            C,
+            B_t,
+            C_t,
             D,
-            z,
+            z_t,
             initial_state,
             state_checkpoints,
+        )
+        grad_x, grad_dt, grad_A, grad_B, grad_C, grad_D, grad_z, grad_is = grads
+        # Gradients come back in the kernel layout and are transposed to match
+        # the [B, L, H] / [B, L, N] inputs of this function.
+        grads = (
+            extension.transpose(grad_x),
+            extension.transpose(grad_dt),
+            grad_A,
+            extension.transpose(grad_B),
+            extension.transpose(grad_C),
+            grad_D,
+            extension.transpose(grad_z),
+            grad_is,
         )
         cast_grads = tuple(grad.to(dtype) for grad, dtype in zip(grads, ctx.input_dtypes))
         return (*cast_grads, None)
@@ -232,12 +262,21 @@ def selective_scan(
             tensor.requires_grad for tensor in (x, dt, A, B, C, D, z, initial_state)
         )
         if needs_backward:
-            y, final_state = _SelectiveScanCuda.apply(
-                *kernel_tensors, extension
-            )
+            y, final_state = _SelectiveScanCuda.apply(*kernel_tensors, extension)
         else:
-            y, _, final_state = extension.forward(*kernel_tensors, False)
-        y = y.to(x.dtype)
+            x_k, dt_k, A_k, B_k, C_k, D_k, z_k, init_k = kernel_tensors
+            y_t, _, final_state = extension.forward(
+                extension.transpose(x_k),
+                extension.transpose(dt_k),
+                A_k,
+                extension.transpose(B_k),
+                extension.transpose(C_k),
+                D_k,
+                extension.transpose(z_k),
+                init_k,
+                False,
+            )
+            y = extension.transpose(y_t).to(x.dtype)
     else:
         y, final_state = _reference_scan(x, dt, A, B, C, D, z, initial_state)
     return (y, final_state) if return_state else y

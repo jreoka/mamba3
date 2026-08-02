@@ -26,6 +26,8 @@ std::vector<torch::Tensor> mamba3_scan_backward_cuda(
     torch::Tensor initial_state,
     torch::Tensor state_checkpoints);
 
+torch::Tensor mamba3_transpose_copy_cuda(torch::Tensor src);
+
 static void check_cuda_contiguous(const torch::Tensor& tensor, const char* name) {
   TORCH_CHECK(tensor.is_cuda(), name, " must be a CUDA tensor");
   TORCH_CHECK(tensor.is_contiguous(), name, " must be contiguous");
@@ -92,7 +94,14 @@ std::vector<torch::Tensor> scan_backward(
       grad_y, grad_final_state, x, dt, A, B, C, D, z, initial_state, state_checkpoints);
 }
 
+torch::Tensor transpose_copy(torch::Tensor src) {
+  check_cuda_contiguous(src, "src");
+  TORCH_CHECK(src.dim() == 3, "src must be [batch, x, y]");
+  return mamba3_transpose_copy_cuda(src);
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
   module.def("forward", &scan_forward, "Fused Mamba3 selective scan forward (CUDA)");
   module.def("backward", &scan_backward, "Fused Mamba3 selective scan backward (CUDA)");
+  module.def("transpose", &transpose_copy, "Fast [B, X, Y] <-> [B, Y, X] transpose (CUDA)");
 }

@@ -88,15 +88,33 @@ logits = lm(input_ids)  # [batch, length, vocab_size]
 
 ## CUDA design
 
-The bundled kernel fuses the selective recurrence, skip connection, and SiLU
-gate into one launch. It uses one CUDA thread per batch/channel recurrence,
-register-resident state, compile-time specializations for state sizes up to 64,
-FP32 state accumulation, coalesced sequence I/O, and a separate handwritten
-reverse recurrence for gradients. Training stores sparse recurrent checkpoints
-and exactly recomputes short chunks in shared memory during the reverse pass
-instead of retaining an `[batch, length, channels, d_state]` history. The Python
-reference implementation is automatically used on CPU or if the local CUDA
-toolchain cannot compile the extension.
+The bundled kernels fuse the selective recurrence, skip connection, and SiLU
+gate into one launch per pass. Instead of walking the whole sequence serially
+with one thread per channel, each block owns one (batch, channel) row and scans
+a 2048-position chunk in parallel: 128 threads hold 16 positions each, and a
+warp-shuffle block scan (inclusive forward for the states, inclusive reverse
+for the adjoints) combines the per-thread partials with two shared-memory
+round trips. This turns a memory-latency-bound serial chain into a
+throughput-friendly parallel scan with a 128x thread multiplier.
+
+Key properties:
+
+- The backward pass splits into two kernels: one computes every gradient
+  except ``grad_B``/``grad_C``, and a second one computes only ``grad_B``/
+  ``grad_C`` with a cross-channel group reduction (one block per batch/state
+  row, 32 channels reduced in registers before a single atomic add per
+  position). This cuts the atomic traffic by 32x, which dominates the naive
+  design's backward cost.
+- Sparse recurrent checkpoints (one (decay, state) pair per chunk) are stored
+  instead of a full ``[batch, length, channels, d_state]`` history; the
+  backward kernels exactly recompute each chunk.
+- Per-position decays use ``exp2f(A * log2(e) * dt)``; the recurrent state and
+  shared gradient accumulation stay in FP32.
+- Channel-major layouts (``[B, H, L]`` / ``[B, N, L]``) keep loads coalesced;
+  a tiled shared-memory transpose kernel converts to and from the public
+  ``[B, L, H]`` API cheaply, replacing PyTorch's slow generic transpose.
+- The Python reference implementation is automatically used on CPU or if the
+  local CUDA toolchain cannot compile the extension.
 
 You can precompile the lazy extension explicitly:
 
@@ -123,19 +141,19 @@ Performance depends heavily on GPU, CUDA/PyTorch versions, shapes, dtype, and
 whether gradients are enabled. Run the included benchmark on the deployment
 machine instead of relying on a universal speed claim.
 
-For reference, the fused inference scan was validated at **4.398 ms / 3.73M
-tokens per second** for `B=8, L=2048, H=512, N=16` on an RTX 4090 with PyTorch
-2.14 nightly and CUDA 13.2. This number is a local measurement, not a guarantee
-for other systems.
+For reference, on an RTX 4090 with PyTorch 2.14 nightly and CUDA 13.2 the fused
+inference scan measures about **0.36 ms / 46M tokens per second** and the
+training scan (forward + backward) about **2.1 ms / 7.7M tokens per second**
+for ``B=8, L=2048, H=512, N=16`` in BF16. These are local measurements, not
+guarantees for other systems.
 
 ## Notes
 
-- `d_state` can be 1 through 64; 8, 16, 32, and 64 map directly to kernel
-  specializations.
-- The fused kernel reads and writes FP16/BF16 activations directly while keeping
+- `d_state` can be 1 through 64; the kernel handles any value in that range.
+- The fused kernels read and write FP16/BF16 activations directly while keeping
   the recurrent state and shared gradient accumulation in FP32 for stability.
 - For the common `d_state=16`, training stores one recurrent checkpoint per
-  eight sequence positions; inference stores no sequence-length state history.
+  2048-position chunk; inference stores no sequence-length state history.
 - Non-causal mode runs both sequence directions and therefore costs roughly twice
   as much scan work as causal mode.
 

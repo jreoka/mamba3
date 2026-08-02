@@ -10,6 +10,18 @@ import torch
 import torch.nn.functional as F
 
 
+# Silence warnings caused by loading and compiling Mamba3's fused CUDA kernels.
+warnings.filterwarnings(
+    "ignore",
+    message=r"Dynamo detected a call to a `functools\.lru_cache`-wrapped function.*",
+)
+warnings.filterwarnings(
+    "ignore",
+    message=r"Dynamo does not know how to trace the builtin `mamba3_cuda_v5\.[^`]*\.row_forward\.`.*",
+)
+warnings.filterwarnings("ignore", message=r"_get_vc_env is private.*")
+
+
 _LOAD_ERROR: Exception | None = None
 
 

@@ -46,8 +46,12 @@ def load_cuda_extension(verbose: bool = False) -> Any | None:
         if os.name == "nt":
             cuda_flags.append("-Xcompiler=/Zc:preprocessor")
         return load(
-            name="mamba3_cuda_v4",
-            sources=[str(root / "scan.cpp"), str(root / "scan_cuda.cu")],
+            name="mamba3_cuda_v5",
+            sources=[
+                str(root / "scan.cpp"),
+                str(root / "scan_cuda.cu"),
+                str(root / "scan_row_cuda.cu"),
+            ],
             extra_cflags=cxx_flags,
             extra_cuda_cflags=cuda_flags,
             verbose=verbose or os.getenv("MAMBA3_VERBOSE_BUILD", "0") == "1",
@@ -201,6 +205,72 @@ class _SelectiveScanCuda(torch.autograd.Function):
         return (*cast_grads, None)
 
 
+class _SelectiveScanCudaRow(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, dt, A, B, C, D, z, initial_state, extension, reverse):
+        tensors = (x, dt, A, B, C, D, z, initial_state)
+        y, state_checkpoints, final_state = extension.row_forward(
+            *tensors, True, reverse
+        )
+        ctx.extension = extension
+        ctx.reverse = reverse
+        ctx.input_dtypes = tuple(tensor.dtype for tensor in tensors)
+        ctx.save_for_backward(*tensors, state_checkpoints)
+        return y.to(x.dtype), final_state
+
+    @staticmethod
+    def backward(ctx, grad_y, grad_final_state):
+        x, dt, A, B, C, D, z, initial_state, state_checkpoints = ctx.saved_tensors
+        if grad_y is None:
+            grad_y = torch.zeros_like(x)
+        if grad_final_state is None:
+            grad_final_state = torch.zeros_like(initial_state)
+        grads = ctx.extension.row_backward(
+            grad_y.to(dtype=x.dtype).contiguous(),
+            grad_final_state.contiguous().float(),
+            x,
+            dt,
+            A,
+            B,
+            C,
+            D,
+            z,
+            initial_state,
+            state_checkpoints,
+            ctx.reverse,
+        )
+        cast_grads = tuple(grad.to(dtype) for grad, dtype in zip(grads, ctx.input_dtypes))
+        return (*cast_grads, None, None)
+
+
+def _use_row_cuda_kernel(batch: int, length: int) -> bool:
+    """Use row parallelism when audio-style shapes provide enough independent rows."""
+
+    return batch >= 8 and length < 2048
+
+
+def _reverse_scan_inputs(
+    x: torch.Tensor,
+    dt: torch.Tensor,
+    A: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor,
+    D: torch.Tensor,
+    z: torch.Tensor,
+    initial_state: torch.Tensor,
+) -> tuple[torch.Tensor, ...]:
+    return (
+        x.flip(1),
+        dt.flip(1),
+        A,
+        B.flip(1),
+        C.flip(1),
+        D,
+        z.flip(1),
+        initial_state,
+    )
+
+
 def _prepare_cuda_inputs(
     x: torch.Tensor,
     dt: torch.Tensor,
@@ -242,11 +312,14 @@ def selective_scan(
     initial_state: torch.Tensor | None = None,
     return_state: bool = False,
     use_cuda_kernel: bool = True,
+    reverse: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Run the gated selective state-space recurrence.
 
     Shapes are ``x/dt/z: [B, L, H]``, ``A: [H, N]``, ``B/C: [B, L, N]``,
     and ``D: [H]``. CUDA uses one fused kernel for recurrence, skip, and gate.
+    ``reverse=True`` scans from the final position while returning outputs in
+    the original sequence order.
     """
 
     batch, _, channels, d_state = _validate_scan_inputs(x, dt, A, B, C, D, z, initial_state)
@@ -257,11 +330,23 @@ def selective_scan(
 
     extension = load_cuda_extension() if use_cuda_kernel and x.is_cuda else None
     if extension is not None:
-        kernel_tensors = _prepare_cuda_inputs(x, dt, A, B, C, D, z, initial_state)
+        use_row_kernel = _use_row_cuda_kernel(batch, x.shape[1])
+        inputs = (x, dt, A, B, C, D, z, initial_state)
+        if reverse and not use_row_kernel:
+            inputs = _reverse_scan_inputs(*inputs)
+        kernel_tensors = _prepare_cuda_inputs(*inputs)
         needs_backward = torch.is_grad_enabled() and any(
             tensor.requires_grad for tensor in (x, dt, A, B, C, D, z, initial_state)
         )
-        if needs_backward:
+        if use_row_kernel and needs_backward:
+            y, final_state = _SelectiveScanCudaRow.apply(
+                *kernel_tensors, extension, reverse
+            )
+        elif use_row_kernel:
+            y, _, final_state = extension.row_forward(
+                *kernel_tensors, False, reverse
+            )
+        elif needs_backward:
             y, final_state = _SelectiveScanCuda.apply(*kernel_tensors, extension)
         else:
             x_k, dt_k, A_k, B_k, C_k, D_k, z_k, init_k = kernel_tensors
@@ -277,6 +362,13 @@ def selective_scan(
                 False,
             )
             y = extension.transpose(y_t).to(x.dtype)
+        if reverse and not use_row_kernel:
+            y = y.flip(1)
     else:
-        y, final_state = _reference_scan(x, dt, A, B, C, D, z, initial_state)
+        inputs = (x, dt, A, B, C, D, z, initial_state)
+        if reverse:
+            inputs = _reverse_scan_inputs(*inputs)
+        y, final_state = _reference_scan(*inputs)
+        if reverse:
+            y = y.flip(1)
     return (y, final_state) if return_state else y

@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from mamba3.ops import load_cuda_extension, selective_scan
+from mamba3.ops import _use_row_cuda_kernel, load_cuda_extension, selective_scan
 
 
 def make_inputs(device: str, requires_grad: bool = False):
@@ -22,7 +22,7 @@ def make_inputs(device: str, requires_grad: bool = False):
     return tuple(value.requires_grad_(requires_grad) for value in values)
 
 
-def run(values, use_cuda_kernel: bool):
+def run(values, use_cuda_kernel: bool, reverse: bool = False):
     x, dt, A, B, C, D, z, initial = values
     return selective_scan(
         x,
@@ -35,7 +35,34 @@ def run(values, use_cuda_kernel: bool):
         initial_state=initial,
         return_state=True,
         use_cuda_kernel=use_cuda_kernel,
+        reverse=reverse,
     )
+
+
+def test_row_kernel_dispatch_targets_high_batch_short_sequences() -> None:
+    assert _use_row_cuda_kernel(batch=124, length=690)
+    assert _use_row_cuda_kernel(batch=690, length=124)
+    assert not _use_row_cuda_kernel(batch=8, length=2048)
+    assert not _use_row_cuda_kernel(batch=1, length=690)
+
+
+def test_reverse_reference_matches_explicit_flip() -> None:
+    values = make_inputs("cpu", requires_grad=False)
+    y_reverse, state_reverse = run(values, use_cuda_kernel=False, reverse=True)
+    x, dt, A, B, C, D, z, initial = values
+    explicit_values = (
+        x.flip(1),
+        dt.flip(1),
+        A,
+        B.flip(1),
+        C.flip(1),
+        D,
+        z.flip(1),
+        initial,
+    )
+    y_explicit, state_explicit = run(explicit_values, use_cuda_kernel=False)
+    torch.testing.assert_close(y_reverse, y_explicit.flip(1))
+    torch.testing.assert_close(state_reverse, state_explicit)
 
 
 def test_reference_scan_state_and_gradients() -> None:
@@ -56,6 +83,31 @@ def test_cuda_matches_reference_forward_and_backward() -> None:
     reference_values = tuple(value.detach().clone().requires_grad_(True) for value in cuda_values)
     y_cuda, state_cuda = run(cuda_values, use_cuda_kernel=True)
     y_ref, state_ref = run(reference_values, use_cuda_kernel=False)
+    torch.testing.assert_close(y_cuda, y_ref, rtol=2e-4, atol=2e-5)
+    torch.testing.assert_close(state_cuda, state_ref, rtol=2e-4, atol=2e-5)
+
+    weights = torch.randn_like(y_cuda)
+    state_weights = torch.randn_like(state_cuda)
+    (y_cuda * weights).sum().add((state_cuda * state_weights).sum()).backward()
+    (y_ref * weights).sum().add((state_ref * state_weights).sum()).backward()
+    for cuda_value, reference_value in zip(cuda_values, reference_values):
+        torch.testing.assert_close(cuda_value.grad, reference_value.grad, rtol=1e-3, atol=2e-4)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_cuda_row_reverse_matches_reference() -> None:
+    if load_cuda_extension() is None:
+        pytest.skip("mamba3 CUDA extension did not compile")
+
+    base_values = make_inputs("cuda")
+    cuda_values = tuple(
+        value if index in (2, 5) else value.repeat(4, *([1] * (value.ndim - 1)))
+        for index, value in enumerate(base_values)
+    )
+    cuda_values = tuple(value.detach().requires_grad_(True) for value in cuda_values)
+    reference_values = tuple(value.detach().clone().requires_grad_(True) for value in cuda_values)
+    y_cuda, state_cuda = run(cuda_values, use_cuda_kernel=True, reverse=True)
+    y_ref, state_ref = run(reference_values, use_cuda_kernel=False, reverse=True)
     torch.testing.assert_close(y_cuda, y_ref, rtol=2e-4, atol=2e-5)
     torch.testing.assert_close(state_cuda, state_ref, rtol=2e-4, atol=2e-5)
 

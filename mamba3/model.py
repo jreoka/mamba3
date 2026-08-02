@@ -84,14 +84,16 @@ class Mamba3Block(nn.Module):
             x = F.pad(x, (left, right))
         return F.silu(self.conv1d(x)).transpose(1, 2)
 
-    def _scan_direction(self, x: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
-        params = self.param_proj(x)
-        rank = self.config.resolved_dt_rank
-        dt_low_rank, B, C = torch.split(
-            params, [rank, self.config.d_state, self.config.d_state], dim=-1
-        )
-        dt = F.softplus(self.dt_proj(dt_low_rank)).clamp(max=1.0)
-        A = -torch.exp(self.A_log.float())
+    def _scan_direction(
+        self,
+        x: torch.Tensor,
+        dt: torch.Tensor,
+        A: torch.Tensor,
+        B: torch.Tensor,
+        C: torch.Tensor,
+        z: torch.Tensor,
+        reverse: bool = False,
+    ) -> torch.Tensor:
         return selective_scan(
             x,
             dt,
@@ -101,7 +103,20 @@ class Mamba3Block(nn.Module):
             self.D,
             z,
             use_cuda_kernel=self.config.use_cuda_kernel,
+            reverse=reverse,
         )
+
+    def _project_scan_parameters(
+        self, x: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        params = self.param_proj(x)
+        rank = self.config.resolved_dt_rank
+        dt_low_rank, B, C = torch.split(
+            params, [rank, self.config.d_state, self.config.d_state], dim=-1
+        )
+        dt = F.softplus(self.dt_proj(dt_low_rank)).clamp(max=1.0)
+        A = -torch.exp(self.A_log.float())
+        return dt, A, B, C
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if hidden_states.ndim != 3 or hidden_states.shape[-1] != self.config.d_model:
@@ -111,11 +126,20 @@ class Mamba3Block(nn.Module):
         residual = hidden_states
         x, z = self.in_proj(self.norm(hidden_states)).chunk(2, dim=-1)
         x = self._convolve(x)
-        forward = self._scan_direction(x, z)
+        dt, A, B, C = self._project_scan_parameters(x)
+        forward = self._scan_direction(x, dt, A, B, C, z)
         if self.config.causal:
             mixed = forward
         else:
-            backward = self._scan_direction(x.flip(1), z.flip(1)).flip(1)
+            backward = self._scan_direction(
+                x,
+                dt,
+                A,
+                B,
+                C,
+                z,
+                reverse=True,
+            )
             mix = torch.sigmoid(self.direction_mix)
             mixed = mix * forward + (1.0 - mix) * backward
         return residual + self.dropout(self.out_proj(mixed))

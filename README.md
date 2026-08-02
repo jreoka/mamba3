@@ -89,13 +89,18 @@ logits = lm(input_ids)  # [batch, length, vocab_size]
 ## CUDA design
 
 The bundled kernels fuse the selective recurrence, skip connection, and SiLU
-gate into one launch per pass. Instead of walking the whole sequence serially
-with one thread per channel, each block owns one (batch, channel) row and scans
-a 2048-position chunk in parallel: 128 threads hold 16 positions each, and a
-warp-shuffle block scan (inclusive forward for the states, inclusive reverse
-for the adjoints) combines the per-thread partials with two shared-memory
-round trips. This turns a memory-latency-bound serial chain into a
-throughput-friendly parallel scan with a 128x thread multiplier.
+gate into one launch per pass. Dispatch selects between two complementary
+implementations:
+
+- Long sequences use a sequence-parallel scan. Each block owns one
+  ``(batch, channel)`` row and scans a 2048-position chunk with 128 threads.
+- High-batch, short-sequence shapes use a row-parallel scan. One thread owns a
+  recurrent row, avoiding mostly idle 128-thread blocks when many independent
+  rows already provide ample GPU parallelism. Reverse scans index the original
+  tensors directly, avoiding full-tensor flips in bidirectional models.
+
+This matters for dual-path audio models, which commonly reshape one axis into a
+large effective batch while scanning sequences of only a few hundred tokens.
 
 Key properties:
 
@@ -107,7 +112,8 @@ Key properties:
   design's backward cost.
 - Sparse recurrent checkpoints (one (decay, state) pair per chunk) are stored
   instead of a full ``[batch, length, channels, d_state]`` history; the
-  backward kernels exactly recompute each chunk.
+  backward kernels exactly recompute each chunk. The row-parallel path uses
+  shorter checkpoint intervals so each backward chunk fits in shared memory.
 - Per-position decays use ``exp2f(A * log2(e) * dt)``; the recurrent state and
   shared gradient accumulation stay in FP32.
 - Channel-major layouts (``[B, H, L]`` / ``[B, N, L]``) keep loads coalesced;

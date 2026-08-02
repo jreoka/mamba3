@@ -33,6 +33,7 @@ def cuda_extensions():
         sources=[
             str(root / "mamba3" / "csrc" / "scan.cpp"),
             str(root / "mamba3" / "csrc" / "scan_cuda.cu"),
+            str(root / "mamba3" / "csrc" / "scan_row_cuda.cu"),
         ],
         extra_compile_args={
             "cxx": ["-O3"] if os.name != "nt" else ["/O2"],

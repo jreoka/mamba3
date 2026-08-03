@@ -17,12 +17,9 @@ warnings.filterwarnings(
 )
 warnings.filterwarnings(
     "ignore",
-    message=r"Dynamo does not know how to trace the builtin `mamba3_cuda_v5\.[^`]*\.row_forward\.`.*",
+    message=r"Dynamo does not know how to trace the builtin `mamba3_cuda_v\d+\.[^`]*\.row_forward\.`.*",
 )
 warnings.filterwarnings("ignore", message=r"_get_vc_env is private.*")
-
-
-_LOAD_ERROR: Exception | None = None
 
 
 @lru_cache(maxsize=1)
@@ -34,7 +31,6 @@ def load_cuda_extension(verbose: bool = False) -> Any | None:
     Set ``MAMBA3_STRICT_CUDA=1`` to turn a build failure into an exception.
     """
 
-    global _LOAD_ERROR
     if os.getenv("MAMBA3_DISABLE_CUDA", "0") == "1" or not torch.cuda.is_available():
         return None
 
@@ -58,7 +54,7 @@ def load_cuda_extension(verbose: bool = False) -> Any | None:
         if os.name == "nt":
             cuda_flags.append("-Xcompiler=/Zc:preprocessor")
         return load(
-            name="mamba3_cuda_v5",
+            name="mamba3_cuda_v6",
             sources=[
                 str(root / "scan.cpp"),
                 str(root / "scan_cuda.cu"),
@@ -69,7 +65,6 @@ def load_cuda_extension(verbose: bool = False) -> Any | None:
             verbose=verbose or os.getenv("MAMBA3_VERBOSE_BUILD", "0") == "1",
         )
     except Exception as exc:  # pragma: no cover - toolchain dependent
-        _LOAD_ERROR = exc
         if os.getenv("MAMBA3_STRICT_CUDA", "0") == "1":
             raise
         warnings.warn(
@@ -79,12 +74,6 @@ def load_cuda_extension(verbose: bool = False) -> Any | None:
             stacklevel=2,
         )
         return None
-
-
-def cuda_extension_available() -> bool:
-    """Return whether the fused CUDA extension can be loaded."""
-
-    return load_cuda_extension() is not None
 
 
 def _validate_scan_inputs(
@@ -105,6 +94,8 @@ def _validate_scan_inputs(
     if A.ndim != 2 or A.shape[0] != channels:
         raise ValueError("A must have shape [channels, d_state]")
     d_state = A.shape[1]
+    if d_state < 1:
+        raise ValueError("d_state must be positive")
     if B.shape != (batch, length, d_state) or C.shape != B.shape:
         raise ValueError("B and C must have shape [batch, length, d_state]")
     if D.shape != (channels,):
@@ -255,10 +246,10 @@ class _SelectiveScanCudaRow(torch.autograd.Function):
         return (*cast_grads, None, None)
 
 
-def _use_row_cuda_kernel(batch: int, length: int) -> bool:
+def _use_row_cuda_kernel(batch: int, length: int, d_state: int = 64) -> bool:
     """Use row parallelism when audio-style shapes provide enough independent rows."""
 
-    return batch >= 8 and length < 2048
+    return d_state <= 64 and batch >= 8 and length < 2048
 
 
 def _reverse_scan_inputs(
@@ -342,7 +333,7 @@ def selective_scan(
 
     extension = load_cuda_extension() if use_cuda_kernel and x.is_cuda else None
     if extension is not None:
-        use_row_kernel = _use_row_cuda_kernel(batch, x.shape[1])
+        use_row_kernel = _use_row_cuda_kernel(batch, x.shape[1], d_state)
         inputs = (x, dt, A, B, C, D, z, initial_state)
         if reverse and not use_row_kernel:
             inputs = _reverse_scan_inputs(*inputs)

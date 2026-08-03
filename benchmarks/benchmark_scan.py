@@ -2,11 +2,10 @@ from __future__ import annotations
 
 import argparse
 import statistics
-import time
 
 import torch
 
-from mamba3 import load_cuda_extension, selective_scan
+from mamba3.ops import load_cuda_extension, selective_scan
 
 
 def elapsed_ms(function, warmup: int, iterations: int) -> float:

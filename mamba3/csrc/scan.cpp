@@ -96,7 +96,7 @@ std::vector<torch::Tensor> scan_forward(
       "x, dt, B, C, and z must have the same dtype");
   TORCH_CHECK(x.dim() == 3, "x must be [batch, length, channels]");
   TORCH_CHECK(A.dim() == 2, "A must be [channels, d_state]");
-  TORCH_CHECK(A.size(1) >= 1 && A.size(1) <= 64, "d_state must be in [1, 64]");
+  TORCH_CHECK(A.size(1) >= 1, "d_state must be positive");
   return mamba3_scan_forward_cuda(x, dt, A, B, C, D, z, initial_state, save_states);
 }
 
@@ -145,7 +145,9 @@ std::vector<torch::Tensor> row_scan_forward(
       "x, dt, B, C, and z must have the same dtype");
   TORCH_CHECK(x.dim() == 3, "x must be [batch, length, channels]");
   TORCH_CHECK(A.dim() == 2, "A must be [channels, d_state]");
-  TORCH_CHECK(A.size(1) >= 1 && A.size(1) <= 64, "d_state must be in [1, 64]");
+  TORCH_CHECK(
+      A.size(1) >= 1 && A.size(1) <= 64,
+      "row kernel d_state must be in [1, 64]");
   return mamba3_row_scan_forward_cuda(
       x, dt, A, B, C, D, z, initial_state, save_states, reverse);
 }

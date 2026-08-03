@@ -13,7 +13,7 @@ namespace {
 constexpr int kThreads = 128;
 constexpr int kItems = 16;
 constexpr int kChunk = kThreads * kItems;  // 2048 sequence positions per chunk
-constexpr int kMaxState = 64;
+constexpr int kFastState = 64;
 constexpr float kLog2E = 1.4426950408889634f;
 
 // Shuffle helpers for float2 (no native float2 shuffle in CUDA).
@@ -197,7 +197,7 @@ __device__ __forceinline__ void block_reverse_scan(
   __syncthreads();
 }
 
-template <typename scalar_t>
+template <typename scalar_t, bool LargeState>
 __global__ __launch_bounds__(kThreads, 3) void scan_forward_kernel(
     const scalar_t *__restrict__ u,
     const scalar_t *__restrict__ delta,
@@ -218,16 +218,16 @@ __global__ __launch_bounds__(kThreads, 3) void scan_forward_kernel(
   const int h = blockIdx.y;
   const int H = gridDim.y;
 
-  __shared__ float2 smem_prefix[kMaxState];
+  __shared__ float2 smem_prefix[kFastState];
   __shared__ float2 smem_warp[4];
 
-  if (threadIdx.x == 0) {
-#pragma unroll
-    for (int n = 0; n < kMaxState; ++n) {
-      if (n < d_state) {
-        smem_prefix[n] =
-            make_float2(1.0f, initial_state[((int64_t)b * H + h) * d_state + n]);
-      }
+  const int64_t state_offset = ((int64_t)b * H + h) * d_state;
+  for (int n = threadIdx.x; n < d_state; n += kThreads) {
+    if constexpr (LargeState) {
+      // final_state doubles as an unrestricted-size recurrence workspace.
+      final_state[state_offset + n] = initial_state[state_offset + n];
+    } else {
+      smem_prefix[n] = make_float2(1.0f, initial_state[state_offset + n]);
     }
   }
   __syncthreads();
@@ -279,14 +279,20 @@ __global__ __launch_bounds__(kThreads, 3) void scan_forward_kernel(
           }
         }
       }
-      const float2 prefix = smem_prefix[state];
+      const float2 prefix = LargeState
+          ? make_float2(1.0f, final_state[state_offset + state])
+          : smem_prefix[state];
       block_scan(items, prefix, smem_warp, ScanCombine());
 #pragma unroll
       for (int i = 0; i < kItems; ++i) {
         out_vals[i] = fmaf(items[i].y, C_vals[i], out_vals[i]);
       }
       if (threadIdx.x == kThreads - 1) {
-        smem_prefix[state] = items[kItems - 1];
+        if constexpr (LargeState) {
+          final_state[state_offset + state] = items[kItems - 1].y;
+        } else {
+          smem_prefix[state] = items[kItems - 1];
+        }
         if (save_states) {
           float *ck =
               states + (((int64_t)b * H + h) * n_chunks + chunk) * (2 * d_state) + 2 * state;
@@ -294,6 +300,11 @@ __global__ __launch_bounds__(kThreads, 3) void scan_forward_kernel(
           ck[1] = items[kItems - 1].y;
         }
       }
+    }
+
+    if constexpr (LargeState) {
+      // Make the global recurrence workspace visible before the next chunk.
+      __syncthreads();
     }
 
     float y_vals[kItems];
@@ -305,13 +316,10 @@ __global__ __launch_bounds__(kThreads, 3) void scan_forward_kernel(
     }
     store_items<scalar_t>(y, row_base, vectorized, remaining, y_vals);
   }
-  __syncthreads();
-  if (threadIdx.x == 0) {
-#pragma unroll
-    for (int n = 0; n < kMaxState; ++n) {
-      if (n < d_state) {
-        final_state[((int64_t)b * H + h) * d_state + n] = smem_prefix[n].y;
-      }
+  if constexpr (!LargeState) {
+    __syncthreads();
+    for (int n = threadIdx.x; n < d_state; n += kThreads) {
+      final_state[state_offset + n] = smem_prefix[n].y;
     }
   }
 }
@@ -320,7 +328,7 @@ __global__ __launch_bounds__(kThreads, 3) void scan_forward_kernel(
 // Pass A: all gradients except grad_B/grad_C (which are computed by
 // scan_backward_bc_kernel with a cross-channel reduction to avoid H-way
 // atomic contention).
-template <typename scalar_t>
+template <typename scalar_t, bool LargeState>
 __global__ __launch_bounds__(kThreads, 2) void scan_backward_kernel(
     const scalar_t *__restrict__ grad_y,
     const float *__restrict__ grad_final_state,
@@ -339,6 +347,7 @@ __global__ __launch_bounds__(kThreads, 2) void scan_backward_kernel(
     float *__restrict__ grad_D,
     scalar_t *__restrict__ grad_z,
     float *__restrict__ grad_initial_state,
+    float *__restrict__ boundary_workspace,
     int length,
     int d_state,
     int n_chunks) {
@@ -346,19 +355,19 @@ __global__ __launch_bounds__(kThreads, 2) void scan_backward_kernel(
   const int h = blockIdx.y;
   const int H = gridDim.y;
 
-  __shared__ float2 smem_postfix[kMaxState];
+  __shared__ float2 smem_postfix[kFastState];
   __shared__ float2 smem_warp[4];
   __shared__ float smem_first_alpha[kThreads];
-  __shared__ float smem_boundary_alpha[kMaxState];
+  __shared__ float smem_boundary_alpha[kFastState];
   __shared__ float smem_reduce[4];
 
-  if (threadIdx.x == 0) {
-#pragma unroll
-    for (int n = 0; n < kMaxState; ++n) {
-      if (n < d_state) {
-        smem_postfix[n] =
-            make_float2(1.0f, grad_final_state[((int64_t)b * H + h) * d_state + n]);
-      }
+  const int64_t state_offset = ((int64_t)b * H + h) * d_state;
+  for (int n = threadIdx.x; n < d_state; n += kThreads) {
+    if constexpr (LargeState) {
+      // Reuse the gradient output as the unrestricted-size postfix workspace.
+      grad_initial_state[state_offset + n] = grad_final_state[state_offset + n];
+    } else {
+      smem_postfix[n] = make_float2(1.0f, grad_final_state[state_offset + n]);
     }
   }
   __syncthreads();
@@ -409,7 +418,9 @@ __global__ __launch_bounds__(kThreads, 2) void scan_backward_kernel(
               : *reinterpret_cast<const float2 *>(
                     states + (((int64_t)b * H + h) * n_chunks + chunk - 1) * (2 * d_state) +
                     2 * state);
-      const float2 postfix = smem_postfix[state];
+      const float2 postfix = LargeState
+          ? make_float2(1.0f, grad_initial_state[state_offset + state])
+          : smem_postfix[state];
 
       const bool state_aligned =
           full && row_aligned && bc_aligned && (((int64_t)state * length * (int64_t)sizeof(scalar_t)) % 16 == 0);
@@ -450,7 +461,11 @@ __global__ __launch_bounds__(kThreads, 2) void scan_backward_kernel(
       }
       reverse_items[kItems - 1] = make_float2(
           threadIdx.x == kThreads - 1
-              ? (chunk == n_chunks - 1 ? 1.0f : smem_boundary_alpha[state])
+              ? (chunk == n_chunks - 1
+                     ? 1.0f
+                     : (LargeState
+                            ? boundary_workspace[state_offset + state]
+                            : smem_boundary_alpha[state]))
               : smem_first_alpha[threadIdx.x + 1],
           dout_vals[kItems - 1] * C_vals[kItems - 1]);
       if (!full) {
@@ -468,11 +483,21 @@ __global__ __launch_bounds__(kThreads, 2) void scan_backward_kernel(
         float2 agg = smem_warp[0];
 #pragma unroll
         for (int j = 1; j < 4; ++j) agg = ReverseCombine()(agg, smem_warp[j]);
-        smem_postfix[state] = ScanCombine()(postfix, agg);
+        const float2 updated_postfix = ScanCombine()(postfix, agg);
+        if constexpr (LargeState) {
+          grad_initial_state[state_offset + state] = updated_postfix.y;
+        } else {
+          smem_postfix[state] = updated_postfix;
+        }
         // Written after the reverse scan so the current chunk's read still
         // sees the previous chunk's first decay (this chunk's own value is
         // consumed by the next chunk).
-        smem_boundary_alpha[state] = exp2f(delta_vals[0] * A_scaled);
+        const float boundary_alpha = exp2f(delta_vals[0] * A_scaled);
+        if constexpr (LargeState) {
+          boundary_workspace[state_offset + state] = boundary_alpha;
+        } else {
+          smem_boundary_alpha[state] = boundary_alpha;
+        }
       }
 
       // The aggregate read above races with the next state's smem_warp
@@ -510,8 +535,7 @@ __global__ __launch_bounds__(kThreads, 2) void scan_backward_kernel(
         for (int j = 0; j < 4; ++j) total += smem_reduce[j];
         atomicAdd(grad_A + h * d_state + state, total);
         if (chunk == 0) {
-          grad_initial_state[((int64_t)b * H + h) * d_state + state] =
-              items[0].x * reverse_items[0].y;
+          grad_initial_state[state_offset + state] = items[0].x * reverse_items[0].y;
         }
       }
     }
@@ -630,9 +654,15 @@ void launch_forward(
     float *states,
     float *final_state,
     int save_states) {
-  scan_forward_kernel<scalar_t><<<grid, kThreads, 0, stream>>>(
-      x, dt, A, B, C, D, z, initial_state, y, states, final_state, length, d_state,
-      n_chunks, save_states);
+  if (d_state <= kFastState) {
+    scan_forward_kernel<scalar_t, false><<<grid, kThreads, 0, stream>>>(
+        x, dt, A, B, C, D, z, initial_state, y, states, final_state, length, d_state,
+        n_chunks, save_states);
+  } else {
+    scan_forward_kernel<scalar_t, true><<<grid, kThreads, 0, stream>>>(
+        x, dt, A, B, C, D, z, initial_state, y, states, final_state, length, d_state,
+        n_chunks, save_states);
+  }
 }
 
 // Pass B: grad_B and grad_C only. Each block owns one (batch, state) row and
@@ -823,10 +853,19 @@ void launch_backward(
     float *grad_A,
     float *grad_D,
     scalar_t *grad_z,
-    float *grad_initial_state) {
-  scan_backward_kernel<scalar_t><<<grid, kThreads, 0, stream>>>(
-      grad_y, grad_final_state, x, dt, A, B, C, D, z, initial_state, states, grad_x,
-      grad_dt, grad_A, grad_D, grad_z, grad_initial_state, length, d_state, n_chunks);
+    float *grad_initial_state,
+    float *boundary_workspace) {
+  if (d_state <= kFastState) {
+    scan_backward_kernel<scalar_t, false><<<grid, kThreads, 0, stream>>>(
+        grad_y, grad_final_state, x, dt, A, B, C, D, z, initial_state, states, grad_x,
+        grad_dt, grad_A, grad_D, grad_z, grad_initial_state, nullptr, length, d_state,
+        n_chunks);
+  } else {
+    scan_backward_kernel<scalar_t, true><<<grid, kThreads, 0, stream>>>(
+        grad_y, grad_final_state, x, dt, A, B, C, D, z, initial_state, states, grad_x,
+        grad_dt, grad_A, grad_D, grad_z, grad_initial_state, boundary_workspace, length,
+        d_state, n_chunks);
+  }
 }
 
 template <typename scalar_t>
@@ -932,6 +971,9 @@ std::vector<torch::Tensor> mamba3_scan_backward_cuda(
   auto grad_D = torch::zeros_like(D);
   auto grad_z = torch::empty_like(z);
   auto grad_initial_state = torch::empty_like(initial_state);
+  auto boundary_workspace = d_state > kFastState
+      ? torch::empty_like(initial_state)
+      : torch::empty({0}, A.options());
 
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   AT_DISPATCH_FLOATING_TYPES_AND2(
@@ -949,7 +991,8 @@ std::vector<torch::Tensor> mamba3_scan_backward_cuda(
             state_checkpoints.numel() > 0 ? state_checkpoints.data_ptr<float>() : nullptr,
             grad_x.data_ptr<scalar_t>(), grad_dt.data_ptr<scalar_t>(),
             grad_A.data_ptr<float>(), grad_D.data_ptr<float>(),
-            grad_z.data_ptr<scalar_t>(), grad_initial_state.data_ptr<float>());
+            grad_z.data_ptr<scalar_t>(), grad_initial_state.data_ptr<float>(),
+            d_state > kFastState ? boundary_workspace.data_ptr<float>() : nullptr);
         launch_backward_bc<scalar_t>(
             length, d_state, n_chunks, channels, grid_bc, stream,
             grad_y.data_ptr<scalar_t>(), grad_final_state.data_ptr<float>(),

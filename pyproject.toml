@@ -28,9 +28,6 @@ Homepage = "https://github.com/jreoka/mamba3"
 Repository = "https://github.com/jreoka/mamba3"
 Issues = "https://github.com/jreoka/mamba3/issues"
 
-[tool.setuptools]
-include-package-data = true
-
 [tool.setuptools.packages.find]
 include = ["mamba3*"]
 

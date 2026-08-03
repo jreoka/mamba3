@@ -40,6 +40,26 @@ Input and output use `[batch, length, d_model]`. Move the model and input to
 CUDA to use the fused kernels; the extension builds lazily on first use.
 `d_state` may be any positive value; values above 64 use the generic CUDA path.
 
+For causal decoding, carry the returned cache instead of rescanning the prefix:
+
+```python
+cache = None
+model.eval()
+with torch.inference_mode():
+    for position in range(x.shape[1]):
+        y, cache = model.step(x[:, position : position + 1], cache)
+```
+
+For fixed-batch CUDA inference, capture the complete recurrent step to minimize
+launch overhead. The returned tensor is reused by each call, so clone it when
+retaining multiple outputs.
+
+```python
+model = model.cuda().eval()
+decoder = model.cuda_graph(batch_size=1)
+y = decoder(x[:, :1].cuda())
+```
+
 > This is an independent selective state-space implementation, not an official
 > implementation from the authors of the Mamba research papers.
 
@@ -48,6 +68,7 @@ CUDA to use the fused kernels; the extension builds lazily on first use.
 ```bash
 pip install -e ".[dev]"
 pytest
+python benchmarks/benchmark_model.py
 ```
 
 ## License

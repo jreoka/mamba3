@@ -3,7 +3,12 @@ from __future__ import annotations
 import pytest
 import torch
 
-from mamba3.ops import _use_row_cuda_kernel, load_cuda_extension, selective_scan
+from mamba3.ops import (
+    _row_checkpoint_bytes,
+    _use_row_cuda_kernel,
+    load_cuda_extension,
+    selective_scan,
+)
 
 
 def make_inputs(device: str, requires_grad: bool = False):
@@ -42,9 +47,16 @@ def run(values, use_cuda_kernel: bool, reverse: bool = False):
 def test_row_kernel_dispatch_targets_high_batch_short_sequences() -> None:
     assert _use_row_cuda_kernel(batch=124, length=690)
     assert _use_row_cuda_kernel(batch=690, length=124)
+    assert _use_row_cuda_kernel(batch=32, length=1024)
     assert not _use_row_cuda_kernel(batch=8, length=2048)
+    assert not _use_row_cuda_kernel(batch=8, length=1024)
     assert not _use_row_cuda_kernel(batch=1, length=690)
     assert not _use_row_cuda_kernel(batch=124, length=690, d_state=65)
+
+
+def test_row_checkpoint_estimate_caps_large_training_shapes() -> None:
+    assert _row_checkpoint_bytes(128, 256, 512, 16) == 128 * 1024**2
+    assert _row_checkpoint_bytes(64, 4096, 1024, 64) == 32 * 1024**3
 
 
 def test_d_state_must_be_positive() -> None:
@@ -60,6 +72,35 @@ def test_d_state_must_be_positive() -> None:
             x,
             use_cuda_kernel=False,
         )
+
+
+def test_empty_scan_preserves_shape_and_state() -> None:
+    x = torch.empty(2, 0, 3)
+    state = torch.randn(2, 3, 4)
+    y, final_state = selective_scan(
+        x,
+        x,
+        -torch.ones(3, 4),
+        torch.empty(2, 0, 4),
+        torch.empty(2, 0, 4),
+        torch.ones(3),
+        x,
+        initial_state=state,
+        return_state=True,
+    )
+    assert y.shape == x.shape
+    torch.testing.assert_close(final_state, state)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_cuda_transpose_supports_misaligned_slices(dtype: torch.dtype) -> None:
+    extension = load_cuda_extension()
+    assert extension is not None
+    storage = torch.randn(2, 64, 65, device="cuda", dtype=dtype)
+    source = storage[:, :, 1:]
+    actual = extension.transpose(source)
+    torch.testing.assert_close(actual, source.transpose(1, 2).contiguous())
 
 
 def test_reverse_reference_matches_explicit_flip() -> None:
@@ -91,14 +132,15 @@ def test_reference_scan_state_and_gradients() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
-def test_cuda_matches_reference_forward_and_backward() -> None:
+@pytest.mark.parametrize("reverse", [False, True])
+def test_cuda_matches_reference_forward_and_backward(reverse: bool) -> None:
     if load_cuda_extension() is None:
         pytest.skip("mamba3 CUDA extension did not compile")
 
     cuda_values = make_inputs("cuda", requires_grad=True)
     reference_values = tuple(value.detach().clone().requires_grad_(True) for value in cuda_values)
-    y_cuda, state_cuda = run(cuda_values, use_cuda_kernel=True)
-    y_ref, state_ref = run(reference_values, use_cuda_kernel=False)
+    y_cuda, state_cuda = run(cuda_values, use_cuda_kernel=True, reverse=reverse)
+    y_ref, state_ref = run(reference_values, use_cuda_kernel=False, reverse=reverse)
     torch.testing.assert_close(y_cuda, y_ref, rtol=2e-4, atol=2e-5)
     torch.testing.assert_close(state_cuda, state_ref, rtol=2e-4, atol=2e-5)
 
@@ -172,6 +214,30 @@ def test_cuda_mixed_precision_matches_reference(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_fp16_cross_channel_gradient_does_not_underflow() -> None:
+    batch, length, channels, state = 1, 1, 1024, 1
+    dtype = torch.float16
+    values = (
+        torch.ones(batch, length, channels, device="cuda", dtype=dtype),
+        torch.zeros(batch, length, channels, device="cuda", dtype=dtype),
+        torch.zeros(channels, state, device="cuda"),
+        torch.ones(batch, length, state, device="cuda", dtype=dtype),
+        torch.zeros(batch, length, state, device="cuda", dtype=dtype),
+        torch.zeros(channels, device="cuda"),
+        torch.full((batch, length, channels), 0.5, device="cuda", dtype=dtype),
+    )
+    cuda_values = tuple(value.detach().requires_grad_(True) for value in values)
+    reference_values = tuple(value.detach().clone().requires_grad_(True) for value in values)
+    y_cuda = selective_scan(*cuda_values)
+    y_reference = selective_scan(*reference_values, use_cuda_kernel=False)
+    upstream = torch.full_like(y_cuda, torch.finfo(dtype).smallest_normal / 1024)
+    (y_cuda * upstream).sum().backward()
+    (y_reference * upstream).sum().backward()
+    assert cuda_values[4].grad.abs().max() > 0
+    torch.testing.assert_close(cuda_values[4].grad, reference_values[4].grad)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
 def test_cuda_long_sequence_gradients_are_stable() -> None:
     if load_cuda_extension() is None:
         pytest.skip("mamba3 CUDA extension did not compile")
@@ -232,3 +298,41 @@ def test_cuda_supports_d_state_above_specialized_range() -> None:
     (y_ref * weights).sum().add((state_ref * state_weights).sum()).backward()
     for cuda_value, reference_value in zip(cuda_values, reference_values):
         torch.testing.assert_close(cuda_value.grad, reference_value.grad, rtol=2e-3, atol=3e-4)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_cuda_crosses_generic_chunk_boundary() -> None:
+    torch.manual_seed(7)
+    batch, length, channels, state = 1, 2051, 3, 4
+    x = torch.randn(batch, length, channels, device="cuda")
+    dt = torch.rand_like(x) * 0.05
+    A = -torch.rand(channels, state, device="cuda")
+    B = torch.randn(batch, length, state, device="cuda")
+    C = torch.randn_like(B)
+    D = torch.randn(channels, device="cuda")
+    z = torch.randn_like(x)
+
+    full, full_state = selective_scan(x, dt, A, B, C, D, z, return_state=True)
+    first, first_state = selective_scan(
+        x[:, :2048],
+        dt[:, :2048],
+        A,
+        B[:, :2048],
+        C[:, :2048],
+        D,
+        z[:, :2048],
+        return_state=True,
+    )
+    second, split_state = selective_scan(
+        x[:, 2048:],
+        dt[:, 2048:],
+        A,
+        B[:, 2048:],
+        C[:, 2048:],
+        D,
+        z[:, 2048:],
+        initial_state=first_state,
+        return_state=True,
+    )
+    torch.testing.assert_close(full, torch.cat((first, second), dim=1), rtol=2e-4, atol=2e-5)
+    torch.testing.assert_close(full_state, split_state, rtol=2e-4, atol=2e-5)

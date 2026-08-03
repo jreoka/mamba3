@@ -13,6 +13,155 @@ namespace {
 constexpr int kForwardThreads = 128;
 constexpr int kBackwardThreads = 64;
 
+template <typename scalar_t>
+__global__ __launch_bounds__(256) void causal_conv_forward_kernel(
+    const scalar_t* __restrict__ x,
+    const scalar_t* __restrict__ weight,
+    const scalar_t* __restrict__ bias,
+    scalar_t* __restrict__ output,
+    int length,
+    int channels,
+    int64_t stride_batch,
+    int64_t stride_time,
+    int64_t stride_channel) {
+  constexpr int kTile = 64;
+  constexpr int kVec = 16 / sizeof(scalar_t);
+  constexpr int kVectors = kTile * kTile / kVec;
+  __shared__ scalar_t smem[kTile][kTile + kVec];
+
+  const int time_base = blockIdx.x * kTile;
+  const int channel_base = blockIdx.y * kTile;
+  const int b = blockIdx.z;
+
+  for (int i = threadIdx.x; i < kTile * kTile; i += blockDim.x) {
+    const int local_time = i / kTile;
+    const int local_channel = i % kTile;
+    const int time = time_base + local_time;
+    const int channel = channel_base + local_channel;
+    scalar_t result = static_cast<scalar_t>(0.0f);
+    if (time < length && channel < channels) {
+      float value = static_cast<float>(bias[channel]);
+#pragma unroll
+      for (int tap = 0; tap < 4; ++tap) {
+        const int source_time = time + tap - 3;
+        if (source_time >= 0) {
+          const int64_t source_offset = (int64_t)b * stride_batch +
+              (int64_t)source_time * stride_time +
+              (int64_t)channel * stride_channel;
+          value = fmaf(
+              static_cast<float>(x[source_offset]),
+              static_cast<float>(weight[(int64_t)channel * 4 + tap]),
+              value);
+        }
+      }
+      const float sigmoid = 1.0f / (1.0f + __expf(-value));
+      result = static_cast<scalar_t>(value * sigmoid);
+    }
+    smem[local_channel][local_time] = result;
+  }
+  __syncthreads();
+
+  const bool vectorized =
+      time_base + kTile <= length && channel_base + kTile <= channels &&
+      ((int64_t)length * sizeof(scalar_t)) % 16 == 0;
+  if (vectorized) {
+    for (int v = threadIdx.x; v < kVectors; v += blockDim.x) {
+      const int local_channel = v / (kTile / kVec);
+      const int time_group = v % (kTile / kVec);
+      uint4 packed;
+      unsigned char* bytes = reinterpret_cast<unsigned char*>(&packed);
+#pragma unroll
+      for (int e = 0; e < kVec; ++e) {
+        *reinterpret_cast<scalar_t*>(bytes + e * sizeof(scalar_t)) =
+            smem[local_channel][time_group * kVec + e];
+      }
+      *reinterpret_cast<uint4*>(
+          output + ((int64_t)b * channels + channel_base + local_channel) * length +
+          time_base + time_group * kVec) = packed;
+    }
+  } else {
+    for (int i = threadIdx.x; i < kTile * kTile; i += blockDim.x) {
+      const int local_channel = i / kTile;
+      const int local_time = i % kTile;
+      const int channel = channel_base + local_channel;
+      const int time = time_base + local_time;
+      if (channel < channels && time < length) {
+        output[((int64_t)b * channels + channel) * length + time] =
+            smem[local_channel][local_time];
+      }
+    }
+  }
+}
+
+template <typename scalar_t>
+__global__ void causal_conv_step_kernel(
+    const scalar_t* __restrict__ x,
+    const scalar_t* __restrict__ state,
+    const scalar_t* __restrict__ weight,
+    const scalar_t* __restrict__ bias,
+    scalar_t* __restrict__ output,
+    scalar_t* __restrict__ next_state,
+    int channels,
+    int64_t total) {
+  const int64_t index = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (index >= total) return;
+  const int channel = static_cast<int>(index % channels);
+  const int64_t state_offset = index * 3;
+  const int64_t weight_offset = (int64_t)channel * 4;
+  const float current = static_cast<float>(x[index]);
+  float value = static_cast<float>(bias[channel]);
+  value = fmaf(static_cast<float>(state[state_offset]),
+      static_cast<float>(weight[weight_offset]), value);
+  value = fmaf(static_cast<float>(state[state_offset + 1]),
+      static_cast<float>(weight[weight_offset + 1]), value);
+  value = fmaf(static_cast<float>(state[state_offset + 2]),
+      static_cast<float>(weight[weight_offset + 2]), value);
+  value = fmaf(current, static_cast<float>(weight[weight_offset + 3]), value);
+  next_state[state_offset] = state[state_offset + 1];
+  next_state[state_offset + 1] = state[state_offset + 2];
+  next_state[state_offset + 2] = static_cast<scalar_t>(current);
+  const float sigmoid = 1.0f / (1.0f + __expf(-value));
+  output[index] = static_cast<scalar_t>(value * sigmoid);
+}
+
+template <typename scalar_t>
+__global__ void scan_step_kernel(
+    const scalar_t* __restrict__ x,
+    const scalar_t* __restrict__ dt_logits,
+    const scalar_t* __restrict__ dt_bias,
+    const float* __restrict__ A,
+    const scalar_t* __restrict__ B,
+    const scalar_t* __restrict__ C,
+    const float* __restrict__ D,
+    const scalar_t* __restrict__ z,
+    const float* __restrict__ state,
+    scalar_t* __restrict__ output,
+    float* __restrict__ next_state,
+    int channels,
+    int d_state,
+    int64_t total) {
+  const int64_t index = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (index >= total) return;
+  const int channel = static_cast<int>(index % channels);
+  const int batch = static_cast<int>(index / channels);
+  const float x_value = static_cast<float>(x[index]);
+  const float q = static_cast<float>(dt_logits[index]) + static_cast<float>(dt_bias[channel]);
+  const float dt = fminf(q > 20.0f ? q : log1pf(__expf(q)), 1.0f);
+  float base = D[channel] * x_value;
+  const int64_t state_offset = index * d_state;
+  const int64_t bc_offset = (int64_t)batch * d_state;
+  for (int n = 0; n < d_state; ++n) {
+    const float decay = __expf(A[(int64_t)channel * d_state + n] * dt);
+    const float value = decay * state[state_offset + n] +
+        static_cast<float>(B[bc_offset + n]) * x_value;
+    next_state[state_offset + n] = value;
+    base = fmaf(value, static_cast<float>(C[bc_offset + n]), base);
+  }
+  const float z_value = static_cast<float>(z[index]);
+  const float sigmoid = 1.0f / (1.0f + __expf(-z_value));
+  output[index] = static_cast<scalar_t>(base * z_value * sigmoid);
+}
+
 template <int N>
 constexpr int checkpoint_stride() {
   // Keep the backward shared-memory working set at 32 KiB for every
@@ -45,14 +194,13 @@ __global__ __launch_bounds__(kForwardThreads) void scan_forward_kernel(
     scalar_t* __restrict__ y,
     float* __restrict__ state_checkpoints,
     float* __restrict__ final_state,
-    int batch,
     int length,
     int channels,
     int d_state,
     int channel_blocks) {
   const int batch_index = blockIdx.x / channel_blocks;
   const int channel = (blockIdx.x % channel_blocks) * blockDim.x + threadIdx.x;
-  if (batch_index >= batch || channel >= channels) return;
+  if (channel >= channels) return;
 
   float state[N];
 #pragma unroll
@@ -115,7 +263,6 @@ __global__ __launch_bounds__(kBackwardThreads) void scan_backward_kernel(
     const scalar_t* __restrict__ C,
     const float* __restrict__ D,
     const scalar_t* __restrict__ z,
-    const float* __restrict__ initial_state,
     const float* __restrict__ state_checkpoints,
     scalar_t* __restrict__ grad_x,
     scalar_t* __restrict__ grad_dt,
@@ -125,14 +272,13 @@ __global__ __launch_bounds__(kBackwardThreads) void scan_backward_kernel(
     float* __restrict__ grad_D,
     scalar_t* __restrict__ grad_z,
     float* __restrict__ grad_initial_state,
-    int batch,
     int length,
     int channels,
     int d_state,
     int channel_blocks) {
   const int batch_index = blockIdx.x / channel_blocks;
   const int channel = (blockIdx.x % channel_blocks) * blockDim.x + threadIdx.x;
-  if (batch_index >= batch || channel >= channels) return;
+  if (channel >= channels) return;
 
   extern __shared__ float chunk_states[];
   constexpr int kStride = checkpoint_stride<N>();
@@ -267,7 +413,6 @@ void launch_forward(
     scalar_t* y,
     float* states,
     float* final_state,
-    int batch,
     int length,
     int channels,
     int channel_blocks,
@@ -275,7 +420,7 @@ void launch_forward(
 #define LAUNCH_FWD(N, REVERSE) scan_forward_kernel<scalar_t, N, SaveCheckpoints, REVERSE> \
     <<<blocks, kForwardThreads, 0, stream>>>( \
     x, dt, A, B, C, D, z, initial_state, y, states, final_state, \
-    batch, length, channels, d_state, channel_blocks)
+    length, channels, d_state, channel_blocks)
   if (reverse) {
     if (d_state <= 8) LAUNCH_FWD(8, true);
     else if (d_state <= 16) LAUNCH_FWD(16, true);
@@ -304,7 +449,6 @@ void launch_backward(
     const scalar_t* C,
     const float* D,
     const scalar_t* z,
-    const float* initial_state,
     const float* state_checkpoints,
     scalar_t* grad_x,
     scalar_t* grad_dt,
@@ -314,7 +458,6 @@ void launch_backward(
     float* grad_D,
     scalar_t* grad_z,
     float* grad_initial_state,
-    int batch,
     int length,
     int channels,
     int channel_blocks,
@@ -322,9 +465,9 @@ void launch_backward(
 #define LAUNCH_BWD(N, STRIDE, REVERSE) scan_backward_kernel<scalar_t, N, REVERSE> \
     <<<blocks, kBackwardThreads, \
     kBackwardThreads * d_state * STRIDE * sizeof(float), stream>>>( \
-    grad_y, grad_final_state, x, dt, A, B, C, D, z, initial_state, state_checkpoints, \
+    grad_y, grad_final_state, x, dt, A, B, C, D, z, state_checkpoints, \
     grad_x, grad_dt, grad_A, grad_B, grad_C, grad_D, grad_z, grad_initial_state, \
-    batch, length, channels, d_state, channel_blocks)
+    length, channels, d_state, channel_blocks)
   if (reverse) {
     if (d_state <= 8) LAUNCH_BWD(8, 16, true);
     else if (d_state <= 16) LAUNCH_BWD(16, 8, true);
@@ -340,6 +483,101 @@ void launch_backward(
 }
 
 }  // namespace
+
+torch::Tensor mamba3_causal_conv_forward_cuda(
+    torch::Tensor x,
+    torch::Tensor weight,
+    torch::Tensor bias) {
+  const c10::cuda::CUDAGuard device_guard(x.device());
+  const int batch = static_cast<int>(x.size(0));
+  const int length = static_cast<int>(x.size(1));
+  const int channels = static_cast<int>(x.size(2));
+  auto output = torch::empty({batch, channels, length}, x.options());
+  if (output.numel() == 0) return output;
+  const dim3 blocks((length + 63) / 64, (channels + 63) / 64, batch);
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      at::ScalarType::Half,
+      at::ScalarType::BFloat16,
+      x.scalar_type(),
+      "mamba3_causal_conv_forward_cuda",
+      [&] {
+        causal_conv_forward_kernel<scalar_t><<<blocks, 256, 0, stream>>>(
+            x.data_ptr<scalar_t>(), weight.data_ptr<scalar_t>(), bias.data_ptr<scalar_t>(),
+            output.data_ptr<scalar_t>(), length, channels, x.stride(0), x.stride(1),
+            x.stride(2));
+      });
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return output;
+}
+
+std::vector<torch::Tensor> mamba3_causal_conv_step_cuda(
+    torch::Tensor x,
+    torch::Tensor state,
+    torch::Tensor weight,
+    torch::Tensor bias) {
+  const c10::cuda::CUDAGuard device_guard(x.device());
+  const int batch = static_cast<int>(x.size(0));
+  const int channels = static_cast<int>(x.size(2));
+  auto output = torch::empty_like(x);
+  auto next_state = torch::empty_like(state);
+  const int64_t total = (int64_t)batch * channels;
+  if (total == 0) return {output, next_state};
+  constexpr int threads = 256;
+  const int blocks = static_cast<int>((total + threads - 1) / threads);
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      at::ScalarType::Half,
+      at::ScalarType::BFloat16,
+      x.scalar_type(),
+      "mamba3_causal_conv_step_cuda",
+      [&] {
+        causal_conv_step_kernel<scalar_t><<<blocks, threads, 0, stream>>>(
+            x.data_ptr<scalar_t>(), state.data_ptr<scalar_t>(),
+            weight.data_ptr<scalar_t>(), bias.data_ptr<scalar_t>(),
+            output.data_ptr<scalar_t>(), next_state.data_ptr<scalar_t>(), channels, total);
+      });
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return {output, next_state};
+}
+
+std::vector<torch::Tensor> mamba3_scan_step_cuda(
+    torch::Tensor x,
+    torch::Tensor dt_logits,
+    torch::Tensor dt_bias,
+    torch::Tensor A,
+    torch::Tensor B,
+    torch::Tensor C,
+    torch::Tensor D,
+    torch::Tensor z,
+    torch::Tensor state) {
+  const c10::cuda::CUDAGuard device_guard(x.device());
+  const int batch = static_cast<int>(x.size(0));
+  const int channels = static_cast<int>(x.size(2));
+  const int d_state = static_cast<int>(A.size(1));
+  auto output = torch::empty_like(x);
+  auto next_state = torch::empty_like(state);
+  const int64_t total = (int64_t)batch * channels;
+  if (total == 0) return {output, next_state};
+  constexpr int threads = 256;
+  const int blocks = static_cast<int>((total + threads - 1) / threads);
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      at::ScalarType::Half,
+      at::ScalarType::BFloat16,
+      x.scalar_type(),
+      "mamba3_scan_step_cuda",
+      [&] {
+        scan_step_kernel<scalar_t><<<blocks, threads, 0, stream>>>(
+            x.data_ptr<scalar_t>(), dt_logits.data_ptr<scalar_t>(),
+            dt_bias.data_ptr<scalar_t>(), A.data_ptr<float>(), B.data_ptr<scalar_t>(),
+            C.data_ptr<scalar_t>(), D.data_ptr<float>(), z.data_ptr<scalar_t>(),
+            state.data_ptr<float>(), output.data_ptr<scalar_t>(),
+            next_state.data_ptr<float>(), channels, d_state, total);
+      });
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return {output, next_state};
+}
 
 std::vector<torch::Tensor> mamba3_row_scan_forward_cuda(
     torch::Tensor x,
@@ -379,16 +617,16 @@ std::vector<torch::Tensor> mamba3_row_scan_forward_cuda(
           launch_forward<scalar_t, true>(
               d_state, blocks, stream, x.data_ptr<scalar_t>(), dt.data_ptr<scalar_t>(),
               A.data_ptr<float>(), B.data_ptr<scalar_t>(), C.data_ptr<scalar_t>(),
-              D.data_ptr<float>(), z.data_ptr<scalar_t>(), initial_state.data_ptr<float>(),
-              y.data_ptr<scalar_t>(), states_ptr, final_state.data_ptr<float>(),
-              batch, length, channels, channel_blocks, reverse);
+               D.data_ptr<float>(), z.data_ptr<scalar_t>(), initial_state.data_ptr<float>(),
+               y.data_ptr<scalar_t>(), states_ptr, final_state.data_ptr<float>(),
+               length, channels, channel_blocks, reverse);
         } else {
           launch_forward<scalar_t, false>(
               d_state, blocks, stream, x.data_ptr<scalar_t>(), dt.data_ptr<scalar_t>(),
               A.data_ptr<float>(), B.data_ptr<scalar_t>(), C.data_ptr<scalar_t>(),
-              D.data_ptr<float>(), z.data_ptr<scalar_t>(), initial_state.data_ptr<float>(),
-              y.data_ptr<scalar_t>(), states_ptr, final_state.data_ptr<float>(),
-              batch, length, channels, channel_blocks, reverse);
+               D.data_ptr<float>(), z.data_ptr<scalar_t>(), initial_state.data_ptr<float>(),
+               y.data_ptr<scalar_t>(), states_ptr, final_state.data_ptr<float>(),
+               length, channels, channel_blocks, reverse);
         }
       });
   C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -437,11 +675,11 @@ std::vector<torch::Tensor> mamba3_row_scan_backward_cuda(
             grad_final_state.data_ptr<float>(), x.data_ptr<scalar_t>(),
             dt.data_ptr<scalar_t>(), A.data_ptr<float>(), B.data_ptr<scalar_t>(),
             C.data_ptr<scalar_t>(), D.data_ptr<float>(), z.data_ptr<scalar_t>(),
-            initial_state.data_ptr<float>(), state_checkpoints.data_ptr<float>(),
-            grad_x.data_ptr<scalar_t>(), grad_dt.data_ptr<scalar_t>(),
+            state_checkpoints.data_ptr<float>(), grad_x.data_ptr<scalar_t>(),
+            grad_dt.data_ptr<scalar_t>(),
             grad_A.data_ptr<float>(), grad_B.data_ptr<float>(), grad_C.data_ptr<float>(),
             grad_D.data_ptr<float>(), grad_z.data_ptr<scalar_t>(),
-            grad_initial_state.data_ptr<float>(), batch, length, channels, channel_blocks,
+            grad_initial_state.data_ptr<float>(), length, channels, channel_blocks,
             reverse);
       });
   C10_CUDA_KERNEL_LAUNCH_CHECK();

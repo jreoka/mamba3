@@ -54,7 +54,7 @@ def load_cuda_extension(verbose: bool = False) -> Any | None:
         if os.name == "nt":
             cuda_flags.append("-Xcompiler=/Zc:preprocessor")
         return load(
-            name="mamba3_cuda_v6",
+            name="mamba3_cuda_v22",
             sources=[
                 str(root / "scan.cpp"),
                 str(root / "scan_cuda.cu"),
@@ -142,19 +142,19 @@ def _reference_scan(
 
 class _SelectiveScanCuda(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, dt, A, B, C, D, z, initial_state, extension):
+    def forward(ctx, x, dt, A, B, C, D, z, initial_state, extension, reverse):
         # The kernels scan sequence positions in parallel, so they want the
         # channel-major layouts [B, H, L] for x/dt/z/y and [B, N, L] for B/C.
         # The fused transposes are cheap GPU copies; doing them inside this
         # function keeps the whole scan a single autograd node.
         kernel_tensors = (
-            extension.transpose(x),
-            extension.transpose(dt),
+            _to_kernel_layout(x, extension, reverse),
+            _to_kernel_layout(dt, extension, reverse),
             A,
-            extension.transpose(B),
-            extension.transpose(C),
+            _to_kernel_layout(B, extension, reverse),
+            _to_kernel_layout(C, extension, reverse),
             D,
-            extension.transpose(z),
+            _to_kernel_layout(z, extension, reverse),
             initial_state,
         )
         # Save sparse recurrent checkpoints (one (decay, state) pair per chunk)
@@ -162,8 +162,10 @@ class _SelectiveScanCuda(torch.autograd.Function):
         # exactly recompute each short chunk, avoiding both the large
         # allocation and unstable reverse inversion of the recurrence.
         y_t, state_checkpoints, final_state = extension.forward(*kernel_tensors, True)
-        y = extension.transpose(y_t)
+        transpose_output = extension.transpose_reverse_y if reverse else extension.transpose
+        y = transpose_output(y_t)
         ctx.extension = extension
+        ctx.reverse = reverse
         ctx.input_dtypes = tuple(tensor.dtype for tensor in (x, dt, A, B, C, D, z, initial_state))
         ctx.save_for_backward(*kernel_tensors, state_checkpoints)
         return y.to(x.dtype), final_state
@@ -175,7 +177,7 @@ class _SelectiveScanCuda(torch.autograd.Function):
         if grad_y is None:
             grad_y = torch.zeros_like(x_t)
         else:
-            grad_y = extension.transpose(grad_y.contiguous())
+            grad_y = _to_kernel_layout(grad_y.contiguous(), extension, ctx.reverse)
         if grad_final_state is None:
             grad_final_state = torch.zeros_like(initial_state)
         grads = extension.backward(
@@ -195,17 +197,17 @@ class _SelectiveScanCuda(torch.autograd.Function):
         # Gradients come back in the kernel layout and are transposed to match
         # the [B, L, H] / [B, L, N] inputs of this function.
         grads = (
-            extension.transpose(grad_x),
-            extension.transpose(grad_dt),
+            (extension.transpose_reverse_y if ctx.reverse else extension.transpose)(grad_x),
+            (extension.transpose_reverse_y if ctx.reverse else extension.transpose)(grad_dt),
             grad_A,
-            extension.transpose(grad_B),
-            extension.transpose(grad_C),
+            (extension.transpose_reverse_y if ctx.reverse else extension.transpose)(grad_B),
+            (extension.transpose_reverse_y if ctx.reverse else extension.transpose)(grad_C),
             grad_D,
-            extension.transpose(grad_z),
+            (extension.transpose_reverse_y if ctx.reverse else extension.transpose)(grad_z),
             grad_is,
         )
         cast_grads = tuple(grad.to(dtype) for grad, dtype in zip(grads, ctx.input_dtypes))
-        return (*cast_grads, None)
+        return (*cast_grads, None, None)
 
 
 class _SelectiveScanCudaRow(torch.autograd.Function):
@@ -249,7 +251,14 @@ class _SelectiveScanCudaRow(torch.autograd.Function):
 def _use_row_cuda_kernel(batch: int, length: int, d_state: int = 64) -> bool:
     """Use row parallelism when audio-style shapes provide enough independent rows."""
 
-    return d_state <= 64 and batch >= 8 and length < 2048
+    return d_state <= 64 and batch >= 8 and length <= 64 * batch
+
+
+def _row_checkpoint_bytes(batch: int, length: int, channels: int, d_state: int) -> int:
+    bucket = 8 if d_state <= 8 else 16 if d_state <= 16 else 32 if d_state <= 32 else 64
+    stride = 128 // bucket
+    checkpoints = (length + stride - 1) // stride
+    return batch * checkpoints * channels * d_state * 4
 
 
 def _reverse_scan_inputs(
@@ -283,6 +292,7 @@ def _prepare_cuda_inputs(
     D: torch.Tensor,
     z: torch.Tensor,
     initial_state: torch.Tensor,
+    contiguous: bool,
 ) -> tuple[torch.Tensor, ...]:
     """Normalize CUDA kernel dtypes without expanding mixed-precision activations."""
 
@@ -291,15 +301,115 @@ def _prepare_cuda_inputs(
         if x.dtype in (torch.float16, torch.bfloat16, torch.float32)
         else torch.float32
     )
+    activations = tuple(
+        tensor.to(dtype=activation_dtype) for tensor in (x, dt, B, C, z)
+    )
+    if contiguous:
+        activations = tuple(tensor.contiguous() for tensor in activations)
+    x, dt, B, C, z = activations
     return (
-        x.to(dtype=activation_dtype).contiguous(),
-        dt.to(dtype=activation_dtype).contiguous(),
+        x,
+        dt,
         A.float().contiguous(),
-        B.to(dtype=activation_dtype).contiguous(),
-        C.to(dtype=activation_dtype).contiguous(),
+        B,
+        C,
         D.float().contiguous(),
-        z.to(dtype=activation_dtype).contiguous(),
+        z,
         initial_state.float().contiguous(),
+    )
+
+
+def _to_kernel_layout(
+    tensor: torch.Tensor, extension, reverse: bool = False
+) -> torch.Tensor:
+    if reverse:
+        return extension.transpose_reverse_x(tensor)
+    transposed = tensor.transpose(1, 2)
+    if transposed.is_contiguous():
+        return transposed
+    return extension.transpose(tensor)
+
+
+def _causal_conv_step(
+    x: torch.Tensor,
+    state: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    extension = load_cuda_extension() if x.is_cuda else None
+    same_dtype = x.dtype == state.dtype == weight.dtype == bias.dtype
+    same_device = x.device == state.device == weight.device == bias.device
+    if (
+        extension is not None
+        and not torch.is_grad_enabled()
+        and same_dtype
+        and same_device
+        and x.dtype in (torch.float16, torch.bfloat16, torch.float32)
+    ):
+        output, state = extension.conv_step(
+            x.contiguous(), state.contiguous(), weight.contiguous(), bias.contiguous()
+        )
+        return output, state
+
+    conv_input = torch.cat((state, x.transpose(1, 2)), dim=-1)
+    output = F.silu(F.conv1d(conv_input, weight, bias=bias, groups=x.shape[-1]))
+    return output.transpose(1, 2), conv_input[:, :, 1:]
+
+
+def _causal_conv_forward(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+) -> torch.Tensor | None:
+    if not x.is_cuda:
+        return None
+    extension = load_cuda_extension()
+    if (
+        extension is None
+        or x.dtype != weight.dtype
+        or x.dtype != bias.dtype
+        or x.device != weight.device
+        or x.device != bias.device
+        or x.dtype not in (torch.float16, torch.bfloat16, torch.float32)
+    ):
+        return None
+    if torch.is_grad_enabled():
+        return None
+    return extension.conv_forward(x, weight.contiguous(), bias.contiguous())
+
+
+def _selective_scan_step(
+    x: torch.Tensor,
+    dt_logits: torch.Tensor,
+    dt_bias: torch.Tensor,
+    A: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor,
+    D: torch.Tensor,
+    z: torch.Tensor,
+    state: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    if torch.is_grad_enabled() or not x.is_cuda:
+        return None
+    extension = load_cuda_extension()
+    activations = (x, dt_logits, dt_bias, B, C, z)
+    if (
+        extension is None
+        or any(tensor.dtype != x.dtype for tensor in activations)
+        or any(tensor.device != x.device for tensor in (*activations, A, D, state))
+        or x.dtype not in (torch.float16, torch.bfloat16, torch.float32)
+    ):
+        return None
+    return extension.scan_step(
+        x.contiguous(),
+        dt_logits.contiguous(),
+        dt_bias.contiguous(),
+        A.float().contiguous(),
+        B.contiguous(),
+        C.contiguous(),
+        D.float().contiguous(),
+        z.contiguous(),
+        state.float().contiguous(),
     )
 
 
@@ -316,6 +426,8 @@ def selective_scan(
     return_state: bool = False,
     use_cuda_kernel: bool = True,
     reverse: bool = False,
+    _force_row: bool = False,
+    _dt_bias: torch.Tensor | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Run the gated selective state-space recurrence.
 
@@ -330,17 +442,33 @@ def selective_scan(
         initial_state = torch.zeros(
             batch, channels, d_state, device=x.device, dtype=torch.float32
         )
+    if batch == 0 or x.shape[1] == 0:
+        return (torch.empty_like(x), initial_state) if return_state else torch.empty_like(x)
 
     extension = load_cuda_extension() if use_cuda_kernel and x.is_cuda else None
+    if _dt_bias is not None and extension is None:
+        dt = F.softplus(dt + _dt_bias).clamp(max=1.0)
+        _dt_bias = None
     if extension is not None:
-        use_row_kernel = _use_row_cuda_kernel(batch, x.shape[1], d_state)
-        inputs = (x, dt, A, B, C, D, z, initial_state)
-        if reverse and not use_row_kernel:
-            inputs = _reverse_scan_inputs(*inputs)
-        kernel_tensors = _prepare_cuda_inputs(*inputs)
         needs_backward = torch.is_grad_enabled() and any(
             tensor.requires_grad for tensor in (x, dt, A, B, C, D, z, initial_state)
         )
+        use_row_kernel = d_state <= 64 and (
+            _force_row or _use_row_cuda_kernel(batch, x.shape[1], d_state)
+        )
+        if use_row_kernel and needs_backward:
+            free_memory, _ = torch.cuda.mem_get_info(x.device)
+            checkpoint_budget = min(2 * 1024**3, free_memory // 4)
+            use_row_kernel = (
+                _row_checkpoint_bytes(batch, x.shape[1], channels, d_state)
+                <= checkpoint_budget
+            )
+        fused_reverse = reverse and not use_row_kernel
+        if _dt_bias is not None and (use_row_kernel or needs_backward):
+            dt = F.softplus(dt + _dt_bias).clamp(max=1.0)
+            _dt_bias = None
+        inputs = (x, dt, A, B, C, D, z, initial_state)
+        kernel_tensors = _prepare_cuda_inputs(*inputs, contiguous=use_row_kernel)
         if use_row_kernel and needs_backward:
             y, final_state = _SelectiveScanCudaRow.apply(
                 *kernel_tensors, extension, reverse
@@ -350,23 +478,32 @@ def selective_scan(
                 *kernel_tensors, False, reverse
             )
         elif needs_backward:
-            y, final_state = _SelectiveScanCuda.apply(*kernel_tensors, extension)
+            y, final_state = _SelectiveScanCuda.apply(
+                *kernel_tensors, extension, fused_reverse
+            )
         else:
             x_k, dt_k, A_k, B_k, C_k, D_k, z_k, init_k = kernel_tensors
-            y_t, _, final_state = extension.forward(
-                extension.transpose(x_k),
-                extension.transpose(dt_k),
+            arguments = (
+                _to_kernel_layout(x_k, extension, fused_reverse),
+                _to_kernel_layout(dt_k, extension, fused_reverse),
+            )
+            if _dt_bias is not None:
+                arguments += (_dt_bias.to(dtype=x_k.dtype).contiguous(),)
+            arguments += (
                 A_k,
-                extension.transpose(B_k),
-                extension.transpose(C_k),
+                _to_kernel_layout(B_k, extension, fused_reverse),
+                _to_kernel_layout(C_k, extension, fused_reverse),
                 D_k,
-                extension.transpose(z_k),
+                _to_kernel_layout(z_k, extension, fused_reverse),
                 init_k,
                 False,
             )
-            y = extension.transpose(y_t).to(x.dtype)
-        if reverse and not use_row_kernel:
-            y = y.flip(1)
+            forward = extension.forward_dt if _dt_bias is not None else extension.forward
+            y_t, _, final_state = forward(*arguments)
+            transpose_output = (
+                extension.transpose_reverse_y if fused_reverse else extension.transpose
+            )
+            y = transpose_output(y_t).to(x.dtype)
     else:
         inputs = (x, dt, A, B, C, D, z, initial_state)
         if reverse:

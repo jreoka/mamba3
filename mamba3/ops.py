@@ -461,13 +461,22 @@ def mamba3_scan(
             q_flat, k_flat.transpose(-1, -2), accumulate_float=True
         )
         causal = causal_mask[:width, :width]
-        decay = torch.exp(cumulative.unsqueeze(-1) - cumulative.unsqueeze(-2))
-        decay = decay.masked_fill(~causal, 0.0)
+        # Mask with -inf before exp: the upper-triangle exponent is positive
+        # and unbounded, so exp-then-mask would compute inf in the forward and
+        # NaN (0 * inf) in the backward at the masked positions.
+        decay = torch.exp(
+            (cumulative.unsqueeze(-1) - cumulative.unsqueeze(-2)).masked_fill(
+                ~causal, -torch.inf
+            )
+        )
         # ``scale`` includes the next token's left endpoint so chunk states
         # compose; the diagonal is set to gamma/scale so that the same-token
         # output sees exactly gamma without a separate correction GEMM.
-        decay.diagonal(0, -2, -1).copy_(
-            diag_decay[:, start:end].permute(0, 2, 1)
+        diagonal = diag_decay[:, start:end].permute(0, 2, 1)
+        decay = torch.where(
+            torch.eye(width, dtype=torch.bool, device=decay.device)[None, None],
+            diagonal.unsqueeze(-1),
+            decay,
         )
         scores = scores.reshape(batch, heads, width, rank, width, rank)
         weighted_scores = (

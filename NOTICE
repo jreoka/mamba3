@@ -1,0 +1,10 @@
+This product includes a modified Mamba-3 SISO decoding kernel derived from
+the official state-spaces/mamba project:
+
+https://github.com/state-spaces/mamba/blob/e9594ce1c732d97440f0332fdc43170a2294dbfa/mamba_ssm/ops/triton/mamba3/mamba3_siso_step.py
+
+Copyright (c) 2025, Dao AI Lab, Goombalab
+Licensed under the Apache License, Version 2.0. The modified implementation is
+in mamba3/_triton.py; the original kernel interface was reduced and its phase,
+rotation, recurrence, cache, skip, and gate operations were fused for this
+package.

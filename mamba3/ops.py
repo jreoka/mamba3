@@ -1,514 +1,544 @@
 from __future__ import annotations
 
+import math
 import os
 import warnings
-from functools import lru_cache
-from pathlib import Path
-from typing import Any
 
 import torch
-import torch.nn.functional as F
+from torch.nn import functional as F
 
 
-# Silence warnings caused by loading and compiling Mamba3's fused CUDA kernels.
-warnings.filterwarnings(
-    "ignore",
-    message=r"Dynamo detected a call to a `functools\.lru_cache`-wrapped function.*",
-)
-warnings.filterwarnings(
-    "ignore",
-    message=r"Dynamo does not know how to trace the builtin `mamba3_cuda_v\d+\.[^`]*\.row_forward\.`.*",
-)
-warnings.filterwarnings("ignore", message=r"_get_vc_env is private.*")
+_TRITON_STEP = None
+_TRITON_STEP_CHECKED = False
+_TRITON_FAILURES: set[tuple[object, ...]] = set()
+_TRITON_LAST_DISPATCH = False
+try:
+    _TORCH_VERSION = tuple(
+        int(part) for part in torch.__version__.split("+", 1)[0].split(".")[:2]
+    )
+except ValueError:  # pragma: no cover - nonstandard development version
+    _TORCH_VERSION = (0, 0)
+_BMM_OUT_DTYPE_SUPPORTED = _TORCH_VERSION >= (2, 8)
 
 
-@lru_cache(maxsize=1)
-def load_cuda_extension(verbose: bool = False) -> Any | None:
-    """Load the prebuilt extension or JIT-compile the bundled CUDA sources.
+def heavy_tail_activation(x: torch.Tensor) -> torch.Tensor:
+    """Positive heavy-tail map used by the maintained Mamba-3 implementation."""
 
-    Compilation is cached by PyTorch, so subsequent processes only load the
-    resulting binary. Returns ``None`` when CUDA compilation is unavailable.
-    Set ``MAMBA3_STRICT_CUDA=1`` to turn a build failure into an exception.
+    negative_branch = torch.reciprocal(1.0 - x.clamp_max(0))
+    return torch.where(x >= 0, 1.0 + x, negative_branch)
+
+
+def rotate_qk(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    phase: torch.Tensor,
+    *,
+    mimo: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply Mamba-3's real representation of data-dependent complex dynamics.
+
+    ``q`` and ``k`` are ``[B, L, H, R, N]`` and ``phase`` is
+    ``[B, L, H, S]``. SISO uses adjacent complex pairs. MIMO follows the
+    official split-half checkpoint layout.
     """
 
-    if os.getenv("MAMBA3_DISABLE_CUDA", "0") == "1" or not torch.cuda.is_available():
+    if q.shape != k.shape or q.ndim != 5:
+        raise ValueError("q and k must have matching [B, L, H, R, N] shapes")
+    if phase.ndim != 4 or phase.shape[:3] != q.shape[:3]:
+        raise ValueError("phase must have shape [B, L, H, S]")
+
+    angles = phase.unsqueeze(3)
+    cosine = torch.cos(angles).to(dtype=q.dtype)
+    sine = torch.sin(angles).to(dtype=q.dtype)
+    angle_count = phase.shape[-1]
+    required_width = (4 if mimo else 2) * angle_count
+    if required_width > q.shape[-1]:
+        raise ValueError("phase has too many angles for the Q/K state width")
+
+    def rotate(tensor: torch.Tensor) -> torch.Tensor:
+        if mimo:
+            # For rope_fraction=0.5, pair the first and third state quarters.
+            first = tensor[..., :angle_count]
+            second = tensor[..., angle_count : 2 * angle_count]
+            third = tensor[..., 2 * angle_count : 3 * angle_count]
+            fourth = tensor[..., 3 * angle_count : 4 * angle_count]
+            tail = tensor[..., 4 * angle_count :]
+            first_rotated = first * cosine - third * sine
+            third_rotated = first * sine + third * cosine
+            return torch.cat(
+                (first_rotated, second, third_rotated, fourth, tail), dim=-1
+            )
+
+        rotary_width = 2 * angle_count
+        paired = tensor[..., :rotary_width].reshape(*tensor.shape[:-1], angle_count, 2)
+        first, second = paired.unbind(dim=-1)
+        first_rotated = first * cosine - second * sine
+        second_rotated = first * sine + second * cosine
+        rotated = torch.stack((first_rotated, second_rotated), dim=-1).flatten(-2)
+        return torch.cat((rotated, tensor[..., rotary_width:]), dim=-1)
+
+    return rotate(q), rotate(k)
+
+
+def fused_siso_step(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    value: torch.Tensor,
+    gate: torch.Tensor,
+    adt: torch.Tensor,
+    dt: torch.Tensor,
+    trap_logits: torch.Tensor,
+    angle_rate: torch.Tensor,
+    D: torch.Tensor,
+    cache: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+) -> tuple[
+    torch.Tensor,
+    tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+] | None:
+    """Use the fused Triton decoder when the runtime and shape support it."""
+
+    global _TRITON_STEP, _TRITON_STEP_CHECKED, _TRITON_LAST_DISPATCH
+    _TRITON_LAST_DISPATCH = False
+    d_state = q.shape[-1]
+    head_dim = value.shape[-1]
+    failure_key = (
+        q.device,
+        q.dtype,
+        k.dtype,
+        value.dtype,
+        gate.dtype,
+        adt.dtype,
+        dt.dtype,
+        trap_logits.dtype,
+        angle_rate.dtype,
+        D.dtype,
+        tuple(tensor.dtype for tensor in cache),
+        d_state,
+        head_dim,
+        cache[0].shape[-1],
+    )
+    supported_shape = (
+        d_state >= 16
+        and head_dim >= 16
+        and d_state & (d_state - 1) == 0
+        and head_dim & (head_dim - 1) == 0
+        and cache[0].shape[-1] <= d_state // 2
+        and cache[2].dtype == q.dtype
+        and cache[3].dtype == value.dtype
+    )
+    if (
+        torch.is_grad_enabled()
+        or not q.is_cuda
+        or q.dtype not in (torch.float16, torch.bfloat16, torch.float32)
+        or not supported_shape
+        or failure_key in _TRITON_FAILURES
+        or os.getenv("MAMBA3_DISABLE_TRITON", "0") == "1"
+    ):
         return None
 
+    if not _TRITON_STEP_CHECKED:
+        _TRITON_STEP_CHECKED = True
+        try:
+            from ._triton import siso_step
+
+            _TRITON_STEP = siso_step
+        except Exception:  # pragma: no cover - optional runtime import
+            _TRITON_STEP = None
+    if _TRITON_STEP is None:
+        return None
     try:
-        from . import _C
-
-        return _C
-    except ImportError:
-        pass
-
-    try:
-        from torch.utils.cpp_extension import load
-
-        root = Path(__file__).resolve().parent / "csrc"
-        cxx_flags = ["/O2"] if os.name == "nt" else ["-O3"]
-        cuda_flags = [
-            "-O3",
-            "--use_fast_math",
-            "--extra-device-vectorization",
-        ]
-        if os.name == "nt":
-            cuda_flags.append("-Xcompiler=/Zc:preprocessor")
-        return load(
-            name="mamba3_cuda_v22",
-            sources=[
-                str(root / "scan.cpp"),
-                str(root / "scan_cuda.cu"),
-                str(root / "scan_row_cuda.cu"),
-            ],
-            extra_cflags=cxx_flags,
-            extra_cuda_cflags=cuda_flags,
-            verbose=verbose or os.getenv("MAMBA3_VERBOSE_BUILD", "0") == "1",
+        result = _TRITON_STEP(
+            q,
+            k,
+            value,
+            gate,
+            adt,
+            dt,
+            trap_logits,
+            angle_rate,
+            D,
+            cache,
         )
-    except Exception as exc:  # pragma: no cover - toolchain dependent
-        if os.getenv("MAMBA3_STRICT_CUDA", "0") == "1":
-            raise
+        _TRITON_LAST_DISPATCH = True
+        return result
+    except Exception as error:  # pragma: no cover - backend and toolchain dependent
+        _TRITON_FAILURES.add(failure_key)
         warnings.warn(
-            f"mamba3 CUDA extension could not be loaded; using the PyTorch "
-            f"reference scan instead. Build error: {exc}",
+            f"fused Mamba-3 decoding is unavailable; using PyTorch ({error})",
             RuntimeWarning,
             stacklevel=2,
         )
         return None
 
 
-def _validate_scan_inputs(
-    x: torch.Tensor,
-    dt: torch.Tensor,
-    A: torch.Tensor,
-    B: torch.Tensor,
-    C: torch.Tensor,
-    D: torch.Tensor,
-    z: torch.Tensor,
-    initial_state: torch.Tensor | None,
-) -> tuple[int, int, int, int]:
-    if x.ndim != 3:
-        raise ValueError(f"x must have shape [batch, length, channels], got {tuple(x.shape)}")
-    batch, length, channels = x.shape
-    if dt.shape != x.shape or z.shape != x.shape:
-        raise ValueError("dt and z must have the same shape as x")
-    if A.ndim != 2 or A.shape[0] != channels:
-        raise ValueError("A must have shape [channels, d_state]")
-    d_state = A.shape[1]
-    if d_state < 1:
-        raise ValueError("d_state must be positive")
-    if B.shape != (batch, length, d_state) or C.shape != B.shape:
-        raise ValueError("B and C must have shape [batch, length, d_state]")
-    if D.shape != (channels,):
-        raise ValueError("D must have shape [channels]")
-    if initial_state is not None and initial_state.shape != (batch, channels, d_state):
-        raise ValueError("initial_state must have shape [batch, channels, d_state]")
-    devices = {tensor.device for tensor in (x, dt, A, B, C, D, z)}
-    if initial_state is not None:
-        devices.add(initial_state.device)
-    if len(devices) != 1:
-        raise ValueError("all selective_scan tensors must be on the same device")
-    return batch, length, channels, d_state
-
-
-def _reference_scan(
-    x: torch.Tensor,
-    dt: torch.Tensor,
-    A: torch.Tensor,
-    B: torch.Tensor,
-    C: torch.Tensor,
-    D: torch.Tensor,
-    z: torch.Tensor,
-    initial_state: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    # State math stays in float32 under autocast; this avoids long-sequence
-    # underflow and matches the CUDA kernel's accumulation behavior.
-    output_dtype = x.dtype
-    x_f, dt_f, A_f = x.float(), dt.float(), A.float()
-    B_f, C_f, D_f, z_f = B.float(), C.float(), D.float(), z.float()
-    state = initial_state.float()
-    outputs: list[torch.Tensor] = []
-    for index in range(x.shape[1]):
-        decay = torch.exp(dt_f[:, index, :, None] * A_f[None, :, :])
-        state = decay * state + x_f[:, index, :, None] * B_f[:, index, None, :]
-        base = (state * C_f[:, index, None, :]).sum(dim=-1)
-        base = base + D_f[None, :] * x_f[:, index, :]
-        outputs.append(base * F.silu(z_f[:, index, :]))
-    if outputs:
-        y = torch.stack(outputs, dim=1)
-    else:
-        y = x_f.new_empty(x_f.shape)
-    return y.to(output_dtype), state
-
-
-class _SelectiveScanCuda(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, x, dt, A, B, C, D, z, initial_state, extension, reverse):
-        # The kernels scan sequence positions in parallel, so they want the
-        # channel-major layouts [B, H, L] for x/dt/z/y and [B, N, L] for B/C.
-        # The fused transposes are cheap GPU copies; doing them inside this
-        # function keeps the whole scan a single autograd node.
-        kernel_tensors = (
-            _to_kernel_layout(x, extension, reverse),
-            _to_kernel_layout(dt, extension, reverse),
-            A,
-            _to_kernel_layout(B, extension, reverse),
-            _to_kernel_layout(C, extension, reverse),
-            D,
-            _to_kernel_layout(z, extension, reverse),
-            initial_state,
-        )
-        # Save sparse recurrent checkpoints (one (decay, state) pair per chunk)
-        # rather than the full [B, L, H, N] history. The backward kernels
-        # exactly recompute each short chunk, avoiding both the large
-        # allocation and unstable reverse inversion of the recurrence.
-        y_t, state_checkpoints, final_state = extension.forward(*kernel_tensors, True)
-        transpose_output = extension.transpose_reverse_y if reverse else extension.transpose
-        y = transpose_output(y_t)
-        ctx.extension = extension
-        ctx.reverse = reverse
-        ctx.input_dtypes = tuple(tensor.dtype for tensor in (x, dt, A, B, C, D, z, initial_state))
-        ctx.save_for_backward(*kernel_tensors, state_checkpoints)
-        return y.to(x.dtype), final_state
-
-    @staticmethod
-    def backward(ctx, grad_y, grad_final_state):
-        x_t, dt_t, A, B_t, C_t, D, z_t, initial_state, state_checkpoints = ctx.saved_tensors
-        extension = ctx.extension
-        if grad_y is None:
-            grad_y = torch.zeros_like(x_t)
-        else:
-            grad_y = _to_kernel_layout(grad_y.contiguous(), extension, ctx.reverse)
-        if grad_final_state is None:
-            grad_final_state = torch.zeros_like(initial_state)
-        grads = extension.backward(
-            grad_y.to(dtype=x_t.dtype).contiguous(),
-            grad_final_state.contiguous().float(),
-            x_t,
-            dt_t,
-            A,
-            B_t,
-            C_t,
-            D,
-            z_t,
-            initial_state,
-            state_checkpoints,
-        )
-        grad_x, grad_dt, grad_A, grad_B, grad_C, grad_D, grad_z, grad_is = grads
-        # Gradients come back in the kernel layout and are transposed to match
-        # the [B, L, H] / [B, L, N] inputs of this function.
-        grads = (
-            (extension.transpose_reverse_y if ctx.reverse else extension.transpose)(grad_x),
-            (extension.transpose_reverse_y if ctx.reverse else extension.transpose)(grad_dt),
-            grad_A,
-            (extension.transpose_reverse_y if ctx.reverse else extension.transpose)(grad_B),
-            (extension.transpose_reverse_y if ctx.reverse else extension.transpose)(grad_C),
-            grad_D,
-            (extension.transpose_reverse_y if ctx.reverse else extension.transpose)(grad_z),
-            grad_is,
-        )
-        cast_grads = tuple(grad.to(dtype) for grad, dtype in zip(grads, ctx.input_dtypes))
-        return (*cast_grads, None, None)
-
-
-class _SelectiveScanCudaRow(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, x, dt, A, B, C, D, z, initial_state, extension, reverse):
-        tensors = (x, dt, A, B, C, D, z, initial_state)
-        y, state_checkpoints, final_state = extension.row_forward(
-            *tensors, True, reverse
-        )
-        ctx.extension = extension
-        ctx.reverse = reverse
-        ctx.input_dtypes = tuple(tensor.dtype for tensor in tensors)
-        ctx.save_for_backward(*tensors, state_checkpoints)
-        return y.to(x.dtype), final_state
-
-    @staticmethod
-    def backward(ctx, grad_y, grad_final_state):
-        x, dt, A, B, C, D, z, initial_state, state_checkpoints = ctx.saved_tensors
-        if grad_y is None:
-            grad_y = torch.zeros_like(x)
-        if grad_final_state is None:
-            grad_final_state = torch.zeros_like(initial_state)
-        grads = ctx.extension.row_backward(
-            grad_y.to(dtype=x.dtype).contiguous(),
-            grad_final_state.contiguous().float(),
-            x,
-            dt,
-            A,
-            B,
-            C,
-            D,
-            z,
-            initial_state,
-            state_checkpoints,
-            ctx.reverse,
-        )
-        cast_grads = tuple(grad.to(dtype) for grad, dtype in zip(grads, ctx.input_dtypes))
-        return (*cast_grads, None, None)
-
-
-def _use_row_cuda_kernel(batch: int, length: int, d_state: int = 64) -> bool:
-    """Use row parallelism when audio-style shapes provide enough independent rows."""
-
-    return d_state <= 64 and batch >= 8 and length <= 64 * batch
-
-
-def _row_checkpoint_bytes(batch: int, length: int, channels: int, d_state: int) -> int:
-    bucket = 8 if d_state <= 8 else 16 if d_state <= 16 else 32 if d_state <= 32 else 64
-    stride = 128 // bucket
-    checkpoints = (length + stride - 1) // stride
-    return batch * checkpoints * channels * d_state * 4
-
-
-def _reverse_scan_inputs(
-    x: torch.Tensor,
-    dt: torch.Tensor,
-    A: torch.Tensor,
-    B: torch.Tensor,
-    C: torch.Tensor,
-    D: torch.Tensor,
-    z: torch.Tensor,
-    initial_state: torch.Tensor,
-) -> tuple[torch.Tensor, ...]:
-    return (
-        x.flip(1),
-        dt.flip(1),
-        A,
-        B.flip(1),
-        C.flip(1),
-        D,
-        z.flip(1),
-        initial_state,
-    )
-
-
-def _prepare_cuda_inputs(
-    x: torch.Tensor,
-    dt: torch.Tensor,
-    A: torch.Tensor,
-    B: torch.Tensor,
-    C: torch.Tensor,
-    D: torch.Tensor,
-    z: torch.Tensor,
-    initial_state: torch.Tensor,
-    contiguous: bool,
-) -> tuple[torch.Tensor, ...]:
-    """Normalize CUDA kernel dtypes without expanding mixed-precision activations."""
-
-    activation_dtype = (
-        x.dtype
-        if x.dtype in (torch.float16, torch.bfloat16, torch.float32)
-        else torch.float32
-    )
-    activations = tuple(
-        tensor.to(dtype=activation_dtype) for tensor in (x, dt, B, C, z)
-    )
-    if contiguous:
-        activations = tuple(tensor.contiguous() for tensor in activations)
-    x, dt, B, C, z = activations
-    return (
-        x,
-        dt,
-        A.float().contiguous(),
-        B,
-        C,
-        D.float().contiguous(),
-        z,
-        initial_state.float().contiguous(),
-    )
-
-
-def _to_kernel_layout(
-    tensor: torch.Tensor, extension, reverse: bool = False
+def _rank_values(
+    value: torch.Tensor,
+    projection: torch.Tensor | None,
 ) -> torch.Tensor:
-    if reverse:
-        return extension.transpose_reverse_x(tensor)
-    transposed = tensor.transpose(1, 2)
-    if transposed.is_contiguous():
-        return transposed
-    return extension.transpose(tensor)
+    if projection is None:
+        return value.unsqueeze(3)
+    return value.unsqueeze(3) * projection.to(value.dtype).unsqueeze(0).unsqueeze(0)
 
 
-def _causal_conv_step(
-    x: torch.Tensor,
-    state: torch.Tensor,
-    weight: torch.Tensor,
-    bias: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    extension = load_cuda_extension() if x.is_cuda else None
-    same_dtype = x.dtype == state.dtype == weight.dtype == bias.dtype
-    same_device = x.device == state.device == weight.device == bias.device
-    if (
-        extension is not None
-        and not torch.is_grad_enabled()
-        and same_dtype
-        and same_device
-        and x.dtype in (torch.float16, torch.bfloat16, torch.float32)
-    ):
-        output, state = extension.conv_step(
-            x.contiguous(), state.contiguous(), weight.contiguous(), bias.contiguous()
-        )
-        return output, state
+class _BmmFloat(torch.autograd.Function):
+    """CUDA low-precision GEMM with an FP32 output and explicit backward."""
 
-    conv_input = torch.cat((state, x.transpose(1, 2)), dim=-1)
-    output = F.silu(F.conv1d(conv_input, weight, bias=bias, groups=x.shape[-1]))
-    return output.transpose(1, 2), conv_input[:, :, 1:]
+    @staticmethod
+    def forward(ctx, left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
+        if ctx.needs_input_grad[0] or ctx.needs_input_grad[1]:
+            ctx.save_for_backward(left, right)
+        return torch.bmm(left, right, out_dtype=torch.float32)
 
-
-def _causal_conv_forward(
-    x: torch.Tensor,
-    weight: torch.Tensor,
-    bias: torch.Tensor,
-) -> torch.Tensor | None:
-    if not x.is_cuda:
-        return None
-    extension = load_cuda_extension()
-    if (
-        extension is None
-        or x.dtype != weight.dtype
-        or x.dtype != bias.dtype
-        or x.device != weight.device
-        or x.device != bias.device
-        or x.dtype not in (torch.float16, torch.bfloat16, torch.float32)
-    ):
-        return None
-    if torch.is_grad_enabled():
-        return None
-    return extension.conv_forward(x, weight.contiguous(), bias.contiguous())
+    @staticmethod
+    def backward(
+        ctx, grad_output: torch.Tensor
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        left, right = ctx.saved_tensors
+        grad_left = grad_right = None
+        with torch.autocast(left.device.type, enabled=False):
+            if ctx.needs_input_grad[0]:
+                grad_left = torch.bmm(
+                    grad_output.float(), right.float().transpose(1, 2)
+                ).to(left.dtype)
+            if ctx.needs_input_grad[1]:
+                grad_right = torch.bmm(
+                    left.float().transpose(1, 2), grad_output.float()
+                ).to(right.dtype)
+        return grad_left, grad_right
 
 
-def _selective_scan_step(
-    x: torch.Tensor,
-    dt_logits: torch.Tensor,
-    dt_bias: torch.Tensor,
-    A: torch.Tensor,
-    B: torch.Tensor,
-    C: torch.Tensor,
-    D: torch.Tensor,
-    z: torch.Tensor,
-    state: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor] | None:
-    if torch.is_grad_enabled() or not x.is_cuda:
-        return None
-    extension = load_cuda_extension()
-    activations = (x, dt_logits, dt_bias, B, C, z)
-    if (
-        extension is None
-        or any(tensor.dtype != x.dtype for tensor in activations)
-        or any(tensor.device != x.device for tensor in (*activations, A, D, state))
-        or x.dtype not in (torch.float16, torch.bfloat16, torch.float32)
-    ):
-        return None
-    return extension.scan_step(
-        x.contiguous(),
-        dt_logits.contiguous(),
-        dt_bias.contiguous(),
-        A.float().contiguous(),
-        B.contiguous(),
-        C.contiguous(),
-        D.float().contiguous(),
-        z.contiguous(),
-        state.float().contiguous(),
+def _batched_matmul(
+    left: torch.Tensor,
+    right: torch.Tensor,
+    *,
+    accumulate_float: bool = False,
+) -> torch.Tensor:
+    """Run one batched GEMM while preserving the leading batch/head axes."""
+
+    leading = left.shape[:-2]
+    if leading != right.shape[:-2]:
+        raise ValueError("batched matrix operands must have matching leading axes")
+    left = left.reshape(-1, left.shape[-2], left.shape[-1])
+    right = right.reshape(-1, right.shape[-2], right.shape[-1])
+    low_precision_cuda = (
+        left.is_cuda
+        and left.dtype in (torch.float16, torch.bfloat16)
+        and right.dtype == left.dtype
+    )
+    if accumulate_float and low_precision_cuda and _BMM_OUT_DTYPE_SUPPORTED:
+        result = _BmmFloat.apply(left, right)
+    elif accumulate_float:
+        with torch.autocast(left.device.type, enabled=False):
+            result = torch.bmm(left.float(), right.float())
+    else:
+        result = torch.bmm(left, right)
+    return result.reshape(*leading, left.shape[-2], right.shape[-1])
+
+
+def _outer_sum(value: torch.Tensor, key: torch.Tensor) -> torch.Tensor:
+    """Sum rank outer products into a head state with FP32 accumulation."""
+
+    return _batched_matmul(
+        value.transpose(-1, -2), key, accumulate_float=True
     )
 
 
-def selective_scan(
-    x: torch.Tensor,
+def mamba3_scan(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    value: torch.Tensor,
+    gate: torch.Tensor,
+    adt: torch.Tensor,
     dt: torch.Tensor,
-    A: torch.Tensor,
-    B: torch.Tensor,
-    C: torch.Tensor,
+    trap_logits: torch.Tensor,
     D: torch.Tensor,
-    z: torch.Tensor,
     *,
+    mimo_x: torch.Tensor | None = None,
+    mimo_z: torch.Tensor | None = None,
+    mimo_out: torch.Tensor | None = None,
+    chunk_size: int = 64,
     initial_state: torch.Tensor | None = None,
-    return_state: bool = False,
-    use_cuda_kernel: bool = True,
-    reverse: bool = False,
-    _force_row: bool = False,
-    _dt_bias: torch.Tensor | None = None,
-) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-    """Run the gated selective state-space recurrence.
+    initial_k: torch.Tensor | None = None,
+    initial_value: torch.Tensor | None = None,
+    phase: torch.Tensor | None = None,
+    mimo_rotation: bool = False,
+    q_bias: torch.Tensor | None = None,
+    k_bias: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Parallel chunked Mamba-3 SSD with FP32 recurrent state.
 
-    Shapes are ``x/dt/z: [B, L, H]``, ``A: [H, N]``, ``B/C: [B, L, N]``,
-    and ``D: [H]``. CUDA uses one fused kernel for recurrence, skip, and gate.
-    ``reverse=True`` scans from the final position while returning outputs in
-    the original sequence order.
+    Shapes are ``q/k: [B,L,G,R,N]``, ``value/gate: [B,L,H,P]`` and
+    ``adt/dt/trap_logits: [B,L,H]``. The algorithm performs only one Python
+    iteration per chunk; all token and rank interactions inside a chunk are
+    batched GEMMs (tensor-core accelerated on supported low-precision CUDA).
     """
 
-    batch, _, channels, d_state = _validate_scan_inputs(x, dt, A, B, C, D, z, initial_state)
-    if initial_state is None:
-        initial_state = torch.zeros(
-            batch, channels, d_state, device=x.device, dtype=torch.float32
-        )
-    if batch == 0 or x.shape[1] == 0:
-        return (torch.empty_like(x), initial_state) if return_state else torch.empty_like(x)
+    if q.shape != k.shape or q.ndim != 5:
+        raise ValueError("q and k must have matching [B, L, G, R, N] shapes")
+    batch, length, qk_heads, rank, d_state = q.shape
+    if value.ndim != 4 or gate.shape != value.shape:
+        raise ValueError("value and gate must have matching [B, L, H, P] shapes")
+    if value.shape[:2] != (batch, length):
+        raise ValueError("value dimensions must match q and k")
+    heads = value.shape[2]
+    if heads % qk_heads != 0:
+        raise ValueError("value heads must be divisible by Q/K groups")
+    if adt.shape != (batch, length, heads):
+        raise ValueError("adt must have shape [B, L, H]")
+    if dt.shape != adt.shape or trap_logits.shape != adt.shape:
+        raise ValueError("dt and trap_logits must match adt")
+    if D.shape != (heads,):
+        raise ValueError("D must have shape [H]")
+    if (q_bias is None) != (k_bias is None):
+        raise ValueError("q_bias and k_bias must be provided together")
+    if q_bias is not None:
+        expected_bias = (heads, rank, d_state)
+        if q_bias.shape != expected_bias or k_bias.shape != expected_bias:
+            raise ValueError(f"Q/K biases must have shape {expected_bias}")
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be positive")
+    if phase is not None and (
+        phase.ndim != 4 or phase.shape[:3] != (batch, length, heads)
+    ):
+        raise ValueError("phase must have shape [B, L, H, S]")
 
-    extension = load_cuda_extension() if use_cuda_kernel and x.is_cuda else None
-    if _dt_bias is not None and extension is None:
-        dt = F.softplus(dt + _dt_bias).clamp(max=1.0)
-        _dt_bias = None
-    if extension is not None:
-        needs_backward = torch.is_grad_enabled() and any(
-            tensor.requires_grad for tensor in (x, dt, A, B, C, D, z, initial_state)
-        )
-        use_row_kernel = d_state <= 64 and (
-            _force_row or _use_row_cuda_kernel(batch, x.shape[1], d_state)
-        )
-        if use_row_kernel and needs_backward:
-            free_memory, _ = torch.cuda.mem_get_info(x.device)
-            checkpoint_budget = min(2 * 1024**3, free_memory // 4)
-            use_row_kernel = (
-                _row_checkpoint_bytes(batch, x.shape[1], channels, d_state)
-                <= checkpoint_budget
-            )
-        fused_reverse = reverse and not use_row_kernel
-        if _dt_bias is not None and (use_row_kernel or needs_backward):
-            dt = F.softplus(dt + _dt_bias).clamp(max=1.0)
-            _dt_bias = None
-        inputs = (x, dt, A, B, C, D, z, initial_state)
-        kernel_tensors = _prepare_cuda_inputs(*inputs, contiguous=use_row_kernel)
-        if use_row_kernel and needs_backward:
-            y, final_state = _SelectiveScanCudaRow.apply(
-                *kernel_tensors, extension, reverse
-            )
-        elif use_row_kernel:
-            y, _, final_state = extension.row_forward(
-                *kernel_tensors, False, reverse
-            )
-        elif needs_backward:
-            y, final_state = _SelectiveScanCuda.apply(
-                *kernel_tensors, extension, fused_reverse
-            )
-        else:
-            x_k, dt_k, A_k, B_k, C_k, D_k, z_k, init_k = kernel_tensors
-            arguments = (
-                _to_kernel_layout(x_k, extension, fused_reverse),
-                _to_kernel_layout(dt_k, extension, fused_reverse),
-            )
-            if _dt_bias is not None:
-                arguments += (_dt_bias.to(dtype=x_k.dtype).contiguous(),)
-            arguments += (
-                A_k,
-                _to_kernel_layout(B_k, extension, fused_reverse),
-                _to_kernel_layout(C_k, extension, fused_reverse),
-                D_k,
-                _to_kernel_layout(z_k, extension, fused_reverse),
-                init_k,
-                False,
-            )
-            forward = extension.forward_dt if _dt_bias is not None else extension.forward
-            y_t, _, final_state = forward(*arguments)
-            transpose_output = (
-                extension.transpose_reverse_y if fused_reverse else extension.transpose
-            )
-            y = transpose_output(y_t).to(x.dtype)
+    head_dim = value.shape[-1]
+    expected_state = (batch, heads, head_dim, d_state)
+    if initial_state is None:
+        state = torch.zeros(expected_state, device=value.device, dtype=torch.float32)
+    elif initial_state.shape != expected_state:
+        raise ValueError(f"initial_state must have shape {expected_state}")
     else:
-        inputs = (x, dt, A, B, C, D, z, initial_state)
-        if reverse:
-            inputs = _reverse_scan_inputs(*inputs)
-        y, final_state = _reference_scan(*inputs)
-        if reverse:
-            y = y.flip(1)
-    return (y, final_state) if return_state else y
+        state = initial_state.float()
+
+    projections = (mimo_x, mimo_z, mimo_out)
+    if rank == 1:
+        if any(projection is not None for projection in projections):
+            raise ValueError("SISO inputs must not provide MIMO projections")
+    else:
+        expected_projection = (heads, rank, head_dim)
+        if any(
+            projection is None or projection.shape != expected_projection
+            for projection in projections
+        ):
+            raise ValueError(f"MIMO projections must have shape {expected_projection}")
+
+    endpoint_cache = initial_k is not None or initial_value is not None
+    if endpoint_cache:
+        expected_k = (batch, heads, rank, d_state)
+        expected_value = (batch, heads, head_dim)
+        if initial_k is None or initial_k.shape != expected_k:
+            raise ValueError(f"initial_k must have shape {expected_k}")
+        if initial_value is None or initial_value.shape != expected_value:
+            raise ValueError(f"initial_value must have shape {expected_value}")
+    if length == 0:
+        return value.clone(), state
+
+    trap = torch.sigmoid(trap_logits.float())
+    gamma = dt * trap
+    next_endpoint = torch.cat(
+        (dt[:, 1:] * (1.0 - trap[:, 1:]), torch.zeros_like(dt[:, :1])),
+        dim=1,
+    )
+    scale = gamma + next_endpoint
+    mimo_x_activation = mimo_x.to(value.dtype) if mimo_x is not None else None
+    mimo_z_activation = mimo_z.to(gate.dtype) if mimo_z is not None else None
+    mimo_out_float = mimo_out.float() if mimo_out is not None else None
+    D_float = D.float()
+    q_bias_activation = q_bias.to(q.dtype) if q_bias is not None else None
+    k_bias_activation = k_bias.to(k.dtype) if k_bias is not None else None
+
+    # A continued segment starts with the previous endpoint contribution. It
+    # is multiplied by alpha at the first token by the inter-chunk path below.
+    if endpoint_cache:
+        previous_rank_value = _rank_values(initial_value.unsqueeze(1), mimo_x).squeeze(1)
+        previous_outer = _outer_sum(previous_rank_value, initial_k)
+        state = state + (
+            dt[:, 0] * (1.0 - trap[:, 0])
+        ).unsqueeze(-1).unsqueeze(-1) * previous_outer
+
+    outputs: list[torch.Tensor] = []
+    causal_mask = torch.ones(
+        min(length, chunk_size),
+        min(length, chunk_size),
+        dtype=torch.bool,
+        device=q.device,
+    ).tril()
+    for start in range(0, length, chunk_size):
+        end = min(start + chunk_size, length)
+        width = end - start
+
+        q_tokens = q[:, start:end]
+        k_tokens = k[:, start:end]
+        if qk_heads == 1 and heads != 1:
+            q_tokens = q_tokens.expand(-1, -1, heads, -1, -1)
+            k_tokens = k_tokens.expand(-1, -1, heads, -1, -1)
+        elif qk_heads != heads:
+            repeats = heads // qk_heads
+            q_tokens = q_tokens.repeat_interleave(repeats, dim=2)
+            k_tokens = k_tokens.repeat_interleave(repeats, dim=2)
+        if q_bias is not None:
+            q_tokens = q_tokens + q_bias_activation[None, None]
+            k_tokens = k_tokens + k_bias_activation[None, None]
+        if phase is not None:
+            q_tokens, k_tokens = rotate_qk(
+                q_tokens,
+                k_tokens,
+                phase[:, start:end],
+                mimo=mimo_rotation,
+            )
+        q_chunk = q_tokens.permute(0, 2, 1, 3, 4)
+        k_chunk = k_tokens.permute(0, 2, 1, 3, 4)
+        base_value_chunk = value[:, start:end].permute(0, 2, 1, 3)
+        base_gate_chunk = gate[:, start:end].permute(0, 2, 1, 3)
+        if mimo_x is None:
+            value_chunk = base_value_chunk.unsqueeze(3)
+            gate_chunk = base_gate_chunk.unsqueeze(3)
+        else:
+            value_chunk = (
+                base_value_chunk.unsqueeze(3)
+                * mimo_x_activation[None, :, None]
+            )
+            gate_chunk = (
+                base_gate_chunk.unsqueeze(3)
+                * mimo_z_activation[None, :, None]
+            )
+        adt_chunk = adt[:, start:end].permute(0, 2, 1).float()
+        scale_chunk = scale[:, start:end].permute(0, 2, 1)
+        next_chunk = next_endpoint[:, start:end].permute(0, 2, 1)
+
+        cumulative = torch.cumsum(adt_chunk, dim=-1)
+        prefix_decay = torch.exp(cumulative)
+
+        q_flat = q_chunk.flatten(2, 3)
+        k_scaled = k_chunk * scale_chunk[..., None, None].to(k_chunk.dtype)
+        k_flat = k_scaled.flatten(2, 3)
+        value_flat = value_chunk.flatten(2, 3)
+
+        # Contribution from all earlier chunks.
+        inter = _batched_matmul(
+            state.to(dtype=q.dtype),
+            q_flat.transpose(-1, -2),
+            accumulate_float=True,
+        ).transpose(-1, -2)
+        inter = inter.reshape(batch, heads, width, rank, head_dim)
+        inter = inter * prefix_decay[..., None, None]
+
+        # Contributions within this chunk. Rank is flattened into the token
+        # axis so one GEMM handles both SISO and MIMO cross-rank interactions.
+        scores = _batched_matmul(
+            q_flat, k_flat.transpose(-1, -2), accumulate_float=True
+        )
+        decay = cumulative.unsqueeze(-1) - cumulative.unsqueeze(-2)
+        causal = causal_mask[:width, :width]
+        decay = torch.exp(decay.masked_fill(~causal, -torch.inf))
+        scores = scores.reshape(batch, heads, width, rank, width, rank)
+        weighted_scores = (
+            scores * decay[:, :, :, None, :, None]
+        ).reshape(batch, heads, width * rank, width * rank).to(value_flat.dtype)
+        intra = _batched_matmul(
+            weighted_scores, value_flat, accumulate_float=True
+        ).reshape(batch, heads, width, rank, head_dim)
+
+        # ``scale`` includes the next token's left trapezoid endpoint so that
+        # chunk states compose. Remove that future endpoint from same-token
+        # outputs, where only gamma is valid.
+        same_token_scores = _batched_matmul(
+            q_chunk, k_chunk.transpose(-1, -2), accumulate_float=True
+        )
+        correction = _batched_matmul(
+            same_token_scores.to(value_chunk.dtype),
+            value_chunk,
+            accumulate_float=True,
+        )
+        correction = correction * next_chunk[..., None, None]
+
+        mixed = inter + intra
+        mixed = mixed - correction
+        mixed = mixed + D_float[None, :, None, None, None] * value_chunk.float()
+
+        mixed = mixed * F.silu(gate_chunk.float())
+        if mimo_out_float is not None:
+            mixed = (
+                mixed * mimo_out_float[None, :, None]
+            ).sum(dim=3)
+        else:
+            mixed = mixed.squeeze(3)
+        outputs.append(mixed.permute(0, 2, 1, 3).to(value.dtype))
+
+        # Carry the pre-state for the next chunk. At the end of the full
+        # sequence next_endpoint is zero, so this is the exact recurrent state.
+        end_decay = torch.exp(cumulative[..., -1:] - cumulative)
+        state_k = k_scaled * end_decay[..., None, None].to(k_scaled.dtype)
+        state_update = _batched_matmul(
+            value_flat.transpose(-1, -2),
+            state_k.flatten(2, 3),
+            accumulate_float=True,
+        )
+        state = (
+            torch.exp(cumulative[..., -1]).unsqueeze(-1).unsqueeze(-1) * state
+            + state_update
+        )
+
+    if outputs:
+        output = torch.cat(outputs, dim=1).to(dtype=value.dtype)
+    else:
+        output = value.new_empty(value.shape)
+    return output, state
+
+
+def mamba3_step(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    value: torch.Tensor,
+    gate: torch.Tensor,
+    adt: torch.Tensor,
+    dt: torch.Tensor,
+    trap_logits: torch.Tensor,
+    D: torch.Tensor,
+    cache: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+    *,
+    mimo_x: torch.Tensor | None = None,
+    mimo_z: torch.Tensor | None = None,
+    mimo_out: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
+    """One exact recurrent Mamba-3 update.
+
+    The phase has already been updated and Q/K rotated. ``cache`` contains
+    phase, FP32 SSM state, previous rotated K, and previous unexpanded value.
+    """
+
+    phase, state, previous_k, previous_value = cache
+    rank_value = _rank_values(value.unsqueeze(1), mimo_x).squeeze(1)
+    rank_gate = _rank_values(gate.unsqueeze(1), mimo_z).squeeze(1)
+    previous_rank_value = _rank_values(previous_value.unsqueeze(1), mimo_x).squeeze(1)
+
+    trap = torch.sigmoid(trap_logits.float())
+    alpha = torch.exp(adt.float())
+    beta = (1.0 - trap) * dt * alpha
+    gamma = trap * dt
+
+    previous_outer = _outer_sum(previous_rank_value, previous_k)
+    current_outer = _outer_sum(rank_value, k)
+    next_state = (
+        alpha[..., None, None] * state.float()
+        + beta[..., None, None] * previous_outer
+        + gamma[..., None, None] * current_outer
+    )
+
+    rank_output = _batched_matmul(
+        q,
+        next_state.to(dtype=q.dtype).transpose(-1, -2),
+        accumulate_float=True,
+    )
+    rank_output = rank_output + D[None, :, None, None].float() * rank_value.float()
+    rank_output = rank_output * F.silu(rank_gate.float())
+    if mimo_out is not None:
+        output = (
+            rank_output * mimo_out.unsqueeze(0).float()
+        ).sum(dim=2)
+    else:
+        output = rank_output.squeeze(2)
+
+    next_cache = (phase, next_state, k, value)
+    return output.to(dtype=value.dtype), next_cache

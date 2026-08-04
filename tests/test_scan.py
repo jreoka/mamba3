@@ -1,338 +1,381 @@
 from __future__ import annotations
 
+import math
+
 import pytest
 import torch
+from torch.nn import functional as F
 
-from mamba3.ops import (
-    _row_checkpoint_bytes,
-    _use_row_cuda_kernel,
-    load_cuda_extension,
-    selective_scan,
-)
+from mamba3.ops import _batched_matmul, heavy_tail_activation, mamba3_scan, rotate_qk
 
 
-def make_inputs(device: str, requires_grad: bool = False):
-    torch.manual_seed(42)
-    batch, length, channels, state = 2, 13, 7, 5
-    values = (
-        torch.randn(batch, length, channels, device=device) * 0.2,
-        torch.rand(batch, length, channels, device=device) * 0.1,
-        -torch.rand(channels, state, device=device) - 0.1,
-        torch.randn(batch, length, state, device=device) * 0.2,
-        torch.randn(batch, length, state, device=device) * 0.2,
-        torch.randn(channels, device=device) * 0.2,
-        torch.randn(batch, length, channels, device=device) * 0.2,
-        torch.randn(batch, channels, state, device=device) * 0.1,
-    )
-    return tuple(value.requires_grad_(requires_grad) for value in values)
+def _rank_values(
+    value: torch.Tensor, projection: torch.Tensor | None
+) -> torch.Tensor:
+    if projection is None:
+        return value.unsqueeze(3)
+    return value.unsqueeze(3) * projection.to(value.dtype)[None, None]
 
 
-def run(values, use_cuda_kernel: bool, reverse: bool = False):
-    x, dt, A, B, C, D, z, initial = values
-    return selective_scan(
-        x,
-        dt,
-        A,
-        B,
-        C,
-        D,
-        z,
-        initial_state=initial,
-        return_state=True,
-        use_cuda_kernel=use_cuda_kernel,
-        reverse=reverse,
-    )
-
-
-def test_row_kernel_dispatch_targets_high_batch_short_sequences() -> None:
-    assert _use_row_cuda_kernel(batch=124, length=690)
-    assert _use_row_cuda_kernel(batch=690, length=124)
-    assert _use_row_cuda_kernel(batch=32, length=1024)
-    assert not _use_row_cuda_kernel(batch=8, length=2048)
-    assert not _use_row_cuda_kernel(batch=8, length=1024)
-    assert not _use_row_cuda_kernel(batch=1, length=690)
-    assert not _use_row_cuda_kernel(batch=124, length=690, d_state=65)
-
-
-def test_row_checkpoint_estimate_caps_large_training_shapes() -> None:
-    assert _row_checkpoint_bytes(128, 256, 512, 16) == 128 * 1024**2
-    assert _row_checkpoint_bytes(64, 4096, 1024, 64) == 32 * 1024**3
-
-
-def test_d_state_must_be_positive() -> None:
-    x = torch.empty(1, 2, 3)
-    with pytest.raises(ValueError, match="d_state must be positive"):
-        selective_scan(
-            x,
-            x,
-            torch.empty(3, 0),
-            torch.empty(1, 2, 0),
-            torch.empty(1, 2, 0),
-            torch.empty(3),
-            x,
-            use_cuda_kernel=False,
+def _recurrent_reference(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    value: torch.Tensor,
+    gate: torch.Tensor,
+    adt: torch.Tensor,
+    dt: torch.Tensor,
+    trap_logits: torch.Tensor,
+    D: torch.Tensor,
+    *,
+    mimo_x: torch.Tensor | None = None,
+    mimo_z: torch.Tensor | None = None,
+    mimo_out: torch.Tensor | None = None,
+    initial_state: torch.Tensor | None = None,
+    initial_k: torch.Tensor | None = None,
+    initial_value: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    batch, length, heads, rank, d_state = q.shape
+    head_dim = value.shape[-1]
+    rank_value = _rank_values(value, mimo_x)
+    rank_gate = _rank_values(gate, mimo_z)
+    state = (
+        torch.zeros(
+            batch,
+            heads,
+            head_dim,
+            d_state,
+            device=q.device,
+            dtype=torch.float32,
         )
-
-
-def test_empty_scan_preserves_shape_and_state() -> None:
-    x = torch.empty(2, 0, 3)
-    state = torch.randn(2, 3, 4)
-    y, final_state = selective_scan(
-        x,
-        x,
-        -torch.ones(3, 4),
-        torch.empty(2, 0, 4),
-        torch.empty(2, 0, 4),
-        torch.ones(3),
-        x,
-        initial_state=state,
-        return_state=True,
+        if initial_state is None
+        else initial_state.float()
     )
-    assert y.shape == x.shape
-    torch.testing.assert_close(final_state, state)
+    previous_k = (
+        torch.zeros(batch, heads, rank, d_state, device=q.device, dtype=q.dtype)
+        if initial_k is None
+        else initial_k
+    )
+    previous_value = (
+        torch.zeros(
+            batch, heads, head_dim, device=value.device, dtype=value.dtype
+        )
+        if initial_value is None
+        else initial_value
+    )
+    previous_rank_value = _rank_values(previous_value.unsqueeze(1), mimo_x).squeeze(1)
+
+    outputs = []
+    for index in range(length):
+        trap = torch.sigmoid(trap_logits[:, index].float())
+        alpha = torch.exp(adt[:, index].float())
+        beta = (1.0 - trap) * dt[:, index] * alpha
+        gamma = trap * dt[:, index]
+        current_value = rank_value[:, index]
+        previous_outer = torch.einsum(
+            "bhrp,bhrn->bhpn", previous_rank_value.float(), previous_k.float()
+        )
+        current_outer = torch.einsum(
+            "bhrp,bhrn->bhpn", current_value.float(), k[:, index].float()
+        )
+        state = (
+            alpha[..., None, None] * state
+            + beta[..., None, None] * previous_outer
+            + gamma[..., None, None] * current_outer
+        )
+        output = torch.einsum(
+            "bhpn,bhrn->bhrp", state, q[:, index].float()
+        )
+        output = output + D[None, :, None, None].float() * current_value.float()
+        output = output * F.silu(rank_gate[:, index].float())
+        if mimo_out is not None:
+            output = (output * mimo_out[None].float()).sum(dim=2)
+        else:
+            output = output.squeeze(2)
+        outputs.append(output)
+        previous_k = k[:, index]
+        previous_rank_value = current_value
+    return torch.stack(outputs, dim=1).to(value.dtype), state
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-def test_cuda_transpose_supports_misaligned_slices(dtype: torch.dtype) -> None:
-    extension = load_cuda_extension()
-    assert extension is not None
-    storage = torch.randn(2, 64, 65, device="cuda", dtype=dtype)
-    source = storage[:, :, 1:]
-    actual = extension.transpose(source)
-    torch.testing.assert_close(actual, source.transpose(1, 2).contiguous())
+def _make_inputs(rank: int, *, requires_grad: bool = False) -> tuple:
+    torch.manual_seed(42 + rank)
+    batch, length, heads, head_dim, d_state = 2, 7, 3, 4, 8
+    q = torch.randn(batch, length, heads, rank, d_state)
+    k = torch.randn_like(q)
+    value = torch.randn(batch, length, heads, head_dim)
+    gate = torch.randn_like(value)
+    adt = -torch.rand(batch, length, heads) * 0.2
+    dt = torch.rand(batch, length, heads) * 0.1 + 0.001
+    trap = torch.randn(batch, length, heads)
+    D = torch.randn(heads)
+    if rank > 1:
+        mimo_x = torch.randn(heads, rank, head_dim) / rank
+        mimo_z = torch.randn(heads, rank, head_dim)
+        mimo_out = torch.randn(heads, rank, head_dim) / rank
+    else:
+        mimo_x = mimo_z = mimo_out = None
+    values = (q, k, value, gate, adt, dt, trap, D, mimo_x, mimo_z, mimo_out)
+    if requires_grad:
+        values = tuple(
+            item.detach().clone().requires_grad_(True) if item is not None else None
+            for item in values
+        )
+    return values
 
 
-def test_reverse_reference_matches_explicit_flip() -> None:
-    values = make_inputs("cpu", requires_grad=False)
-    y_reverse, state_reverse = run(values, use_cuda_kernel=False, reverse=True)
-    x, dt, A, B, C, D, z, initial = values
-    explicit_values = (
-        x.flip(1),
-        dt.flip(1),
-        A,
-        B.flip(1),
-        C.flip(1),
+def _run(values: tuple, chunk_size: int) -> tuple[torch.Tensor, torch.Tensor]:
+    q, k, value, gate, adt, dt, trap, D, mimo_x, mimo_z, mimo_out = values
+    return mamba3_scan(
+        q,
+        k,
+        value,
+        gate,
+        adt,
+        dt,
+        trap,
         D,
-        z.flip(1),
-        initial,
+        mimo_x=mimo_x,
+        mimo_z=mimo_z,
+        mimo_out=mimo_out,
+        chunk_size=chunk_size,
     )
-    y_explicit, state_explicit = run(explicit_values, use_cuda_kernel=False)
-    torch.testing.assert_close(y_reverse, y_explicit.flip(1))
-    torch.testing.assert_close(state_reverse, state_explicit)
 
 
-def test_reference_scan_state_and_gradients() -> None:
-    values = make_inputs("cpu", requires_grad=True)
-    y, state = run(values, use_cuda_kernel=False)
-    (y.square().mean() + state.square().mean()).backward()
-    assert y.shape == (2, 13, 7)
-    assert state.shape == (2, 7, 5)
-    assert all(value.grad is not None and torch.isfinite(value.grad).all() for value in values)
+def test_heavy_tail_activation_matches_definition_and_gradient() -> None:
+    x = torch.tensor([-3.0, -0.5, 0.0, 0.5, 3.0], requires_grad=True)
+    expected = torch.where(x >= 0, 1.0 + x, 1.0 / (1.0 - x))
+    actual = heavy_tail_activation(x)
+    torch.testing.assert_close(actual, expected)
+    actual.sum().backward()
+    expected_gradient = torch.where(x >= 0, torch.ones_like(x), expected.square())
+    torch.testing.assert_close(x.grad, expected_gradient)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
-@pytest.mark.parametrize("reverse", [False, True])
-def test_cuda_matches_reference_forward_and_backward(reverse: bool) -> None:
-    if load_cuda_extension() is None:
-        pytest.skip("mamba3 CUDA extension did not compile")
-
-    cuda_values = make_inputs("cuda", requires_grad=True)
-    reference_values = tuple(value.detach().clone().requires_grad_(True) for value in cuda_values)
-    y_cuda, state_cuda = run(cuda_values, use_cuda_kernel=True, reverse=reverse)
-    y_ref, state_ref = run(reference_values, use_cuda_kernel=False, reverse=reverse)
-    torch.testing.assert_close(y_cuda, y_ref, rtol=2e-4, atol=2e-5)
-    torch.testing.assert_close(state_cuda, state_ref, rtol=2e-4, atol=2e-5)
-
-    weights = torch.randn_like(y_cuda)
-    state_weights = torch.randn_like(state_cuda)
-    (y_cuda * weights).sum().add((state_cuda * state_weights).sum()).backward()
-    (y_ref * weights).sum().add((state_ref * state_weights).sum()).backward()
-    for cuda_value, reference_value in zip(cuda_values, reference_values):
-        torch.testing.assert_close(cuda_value.grad, reference_value.grad, rtol=1e-3, atol=2e-4)
+def test_siso_rotation_uses_adjacent_complex_pairs() -> None:
+    q = torch.tensor([[[[[1.0, 0.0, 2.0, 0.0, 5.0, 6.0, 7.0, 8.0]]]]])
+    phase = torch.tensor([[[[math.pi / 2, 0.0]]]])
+    actual, _ = rotate_qk(q, q, phase, mimo=False)
+    expected = torch.tensor([[[[[0.0, 1.0, 2.0, 0.0, 5.0, 6.0, 7.0, 8.0]]]]])
+    torch.testing.assert_close(actual, expected, atol=1e-6, rtol=0)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
-def test_cuda_row_reverse_matches_reference() -> None:
-    if load_cuda_extension() is None:
-        pytest.skip("mamba3 CUDA extension did not compile")
-
-    base_values = make_inputs("cuda")
-    cuda_values = tuple(
-        value if index in (2, 5) else value.repeat(4, *([1] * (value.ndim - 1)))
-        for index, value in enumerate(base_values)
-    )
-    cuda_values = tuple(value.detach().requires_grad_(True) for value in cuda_values)
-    reference_values = tuple(value.detach().clone().requires_grad_(True) for value in cuda_values)
-    y_cuda, state_cuda = run(cuda_values, use_cuda_kernel=True, reverse=True)
-    y_ref, state_ref = run(reference_values, use_cuda_kernel=False, reverse=True)
-    torch.testing.assert_close(y_cuda, y_ref, rtol=2e-4, atol=2e-5)
-    torch.testing.assert_close(state_cuda, state_ref, rtol=2e-4, atol=2e-5)
-
-    weights = torch.randn_like(y_cuda)
-    state_weights = torch.randn_like(state_cuda)
-    (y_cuda * weights).sum().add((state_cuda * state_weights).sum()).backward()
-    (y_ref * weights).sum().add((state_ref * state_weights).sum()).backward()
-    for cuda_value, reference_value in zip(cuda_values, reference_values):
-        torch.testing.assert_close(cuda_value.grad, reference_value.grad, rtol=1e-3, atol=2e-4)
+def test_mimo_rotation_matches_official_split_half_layout() -> None:
+    q = torch.tensor([[[[[1.0, 2.0, 3.0, 4.0, 0.0, 5.0, 6.0, 7.0]]]]])
+    phase = torch.tensor([[[[math.pi / 2, 0.0]]]])
+    actual, _ = rotate_qk(q, q, phase, mimo=True)
+    expected = torch.tensor([[[[[0.0, 2.0, 3.0, 4.0, 1.0, 5.0, 6.0, 7.0]]]]])
+    torch.testing.assert_close(actual, expected, atol=1e-6, rtol=0)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
-@pytest.mark.parametrize(
-    ("dtype", "rtol", "atol"),
-    ((torch.float16, 5e-3, 5e-4), (torch.bfloat16, 2e-2, 2e-3)),
-)
-def test_cuda_mixed_precision_matches_reference(
-    dtype: torch.dtype,
-    rtol: float,
-    atol: float,
+@pytest.mark.parametrize("rank,chunk_size", [(1, 3), (4, 2), (4, 5)])
+def test_chunked_scan_matches_independent_recurrence(
+    rank: int, chunk_size: int
 ) -> None:
-    if load_cuda_extension() is None:
-        pytest.skip("mamba3 CUDA extension did not compile")
-
-    cuda_values = make_inputs("cuda", requires_grad=True)
-    cuda_values = tuple(
-        value.detach().to(dtype).requires_grad_(True)
-        if index not in (2, 5, 7)
-        else value
-        for index, value in enumerate(cuda_values)
-    )
-    reference_values = tuple(value.detach().clone().requires_grad_(True) for value in cuda_values)
-    y_cuda, state_cuda = run(cuda_values, use_cuda_kernel=True)
-    y_ref, state_ref = run(reference_values, use_cuda_kernel=False)
-    assert y_cuda.dtype == dtype
-    assert state_cuda.dtype == torch.float32
-    torch.testing.assert_close(y_cuda, y_ref, rtol=rtol, atol=atol)
-    torch.testing.assert_close(state_cuda, state_ref, rtol=1e-3, atol=2e-4)
-
-    weights = torch.randn_like(y_cuda)
-    state_weights = torch.randn_like(state_cuda)
-    (y_cuda * weights).sum().add((state_cuda * state_weights).sum()).backward()
-    (y_ref * weights).sum().add((state_ref * state_weights).sum()).backward()
-    for cuda_value, reference_value in zip(cuda_values, reference_values):
-        torch.testing.assert_close(cuda_value.grad, reference_value.grad, rtol=rtol, atol=atol)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
-def test_fp16_cross_channel_gradient_does_not_underflow() -> None:
-    batch, length, channels, state = 1, 1, 1024, 1
-    dtype = torch.float16
-    values = (
-        torch.ones(batch, length, channels, device="cuda", dtype=dtype),
-        torch.zeros(batch, length, channels, device="cuda", dtype=dtype),
-        torch.zeros(channels, state, device="cuda"),
-        torch.ones(batch, length, state, device="cuda", dtype=dtype),
-        torch.zeros(batch, length, state, device="cuda", dtype=dtype),
-        torch.zeros(channels, device="cuda"),
-        torch.full((batch, length, channels), 0.5, device="cuda", dtype=dtype),
-    )
-    cuda_values = tuple(value.detach().requires_grad_(True) for value in values)
-    reference_values = tuple(value.detach().clone().requires_grad_(True) for value in values)
-    y_cuda = selective_scan(*cuda_values)
-    y_reference = selective_scan(*reference_values, use_cuda_kernel=False)
-    upstream = torch.full_like(y_cuda, torch.finfo(dtype).smallest_normal / 1024)
-    (y_cuda * upstream).sum().backward()
-    (y_reference * upstream).sum().backward()
-    assert cuda_values[4].grad.abs().max() > 0
-    torch.testing.assert_close(cuda_values[4].grad, reference_values[4].grad)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
-def test_cuda_long_sequence_gradients_are_stable() -> None:
-    if load_cuda_extension() is None:
-        pytest.skip("mamba3 CUDA extension did not compile")
-
-    torch.manual_seed(123)
-    batch, length, channels, state = 1, 257, 5, 16
-    cuda_values = (
-        torch.randn(batch, length, channels, device="cuda") * 0.2,
-        torch.rand(batch, length, channels, device="cuda") * 0.099 + 0.001,
-        -torch.arange(1, state + 1, device="cuda").float().repeat(channels, 1),
-        torch.randn(batch, length, state, device="cuda") * 0.2,
-        torch.randn(batch, length, state, device="cuda") * 0.2,
-        torch.randn(channels, device="cuda") * 0.2,
-        torch.randn(batch, length, channels, device="cuda") * 0.2,
-        torch.zeros(batch, channels, state, device="cuda"),
-    )
-    cuda_values = tuple(value.requires_grad_(True) for value in cuda_values)
-    reference_values = tuple(value.detach().clone().requires_grad_(True) for value in cuda_values)
-    y_cuda, state_cuda = run(cuda_values, use_cuda_kernel=True)
-    y_ref, state_ref = run(reference_values, use_cuda_kernel=False)
-    weights = torch.randn_like(y_cuda)
-    state_weights = torch.randn_like(state_cuda)
-    (y_cuda * weights).sum().add((state_cuda * state_weights).sum()).backward()
-    (y_ref * weights).sum().add((state_ref * state_weights).sum()).backward()
-
-    for cuda_value, reference_value in zip(cuda_values, reference_values):
-        assert torch.isfinite(cuda_value.grad).all()
-        torch.testing.assert_close(cuda_value.grad, reference_value.grad, rtol=2e-3, atol=3e-4)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
-def test_cuda_supports_d_state_above_specialized_range() -> None:
-    if load_cuda_extension() is None:
-        pytest.skip("mamba3 CUDA extension did not compile")
-
-    torch.manual_seed(321)
-    batch, length, channels, state = 8, 9, 3, 65
-    cuda_values = (
-        torch.randn(batch, length, channels, device="cuda") * 0.2,
-        torch.rand(batch, length, channels, device="cuda") * 0.1,
-        -torch.rand(channels, state, device="cuda") - 0.1,
-        torch.randn(batch, length, state, device="cuda") * 0.2,
-        torch.randn(batch, length, state, device="cuda") * 0.2,
-        torch.randn(channels, device="cuda") * 0.2,
-        torch.randn(batch, length, channels, device="cuda") * 0.2,
-        torch.randn(batch, channels, state, device="cuda") * 0.1,
-    )
-    cuda_values = tuple(value.requires_grad_(True) for value in cuda_values)
-    reference_values = tuple(value.detach().clone().requires_grad_(True) for value in cuda_values)
-    y_cuda, state_cuda = run(cuda_values, use_cuda_kernel=True)
-    y_ref, state_ref = run(reference_values, use_cuda_kernel=False)
-    torch.testing.assert_close(y_cuda, y_ref, rtol=3e-4, atol=3e-5)
-    torch.testing.assert_close(state_cuda, state_ref, rtol=3e-4, atol=3e-5)
-
-    weights = torch.randn_like(y_cuda)
-    state_weights = torch.randn_like(state_cuda)
-    (y_cuda * weights).sum().add((state_cuda * state_weights).sum()).backward()
-    (y_ref * weights).sum().add((state_ref * state_weights).sum()).backward()
-    for cuda_value, reference_value in zip(cuda_values, reference_values):
-        torch.testing.assert_close(cuda_value.grad, reference_value.grad, rtol=2e-3, atol=3e-4)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
-def test_cuda_crosses_generic_chunk_boundary() -> None:
-    torch.manual_seed(7)
-    batch, length, channels, state = 1, 2051, 3, 4
-    x = torch.randn(batch, length, channels, device="cuda")
-    dt = torch.rand_like(x) * 0.05
-    A = -torch.rand(channels, state, device="cuda")
-    B = torch.randn(batch, length, state, device="cuda")
-    C = torch.randn_like(B)
-    D = torch.randn(channels, device="cuda")
-    z = torch.randn_like(x)
-
-    full, full_state = selective_scan(x, dt, A, B, C, D, z, return_state=True)
-    first, first_state = selective_scan(
-        x[:, :2048],
-        dt[:, :2048],
-        A,
-        B[:, :2048],
-        C[:, :2048],
+    values = _make_inputs(rank)
+    actual, actual_state = _run(values, chunk_size)
+    q, k, value, gate, adt, dt, trap, D, mimo_x, mimo_z, mimo_out = values
+    expected, expected_state = _recurrent_reference(
+        q,
+        k,
+        value,
+        gate,
+        adt,
+        dt,
+        trap,
         D,
-        z[:, :2048],
-        return_state=True,
+        mimo_x=mimo_x,
+        mimo_z=mimo_z,
+        mimo_out=mimo_out,
     )
-    second, split_state = selective_scan(
-        x[:, 2048:],
-        dt[:, 2048:],
-        A,
-        B[:, 2048:],
-        C[:, 2048:],
+    torch.testing.assert_close(actual, expected, rtol=2e-5, atol=2e-6)
+    torch.testing.assert_close(actual_state, expected_state, rtol=2e-5, atol=2e-6)
+
+
+@pytest.mark.parametrize("rank", [1, 4])
+def test_chunked_scan_gradients_match_recurrence(rank: int) -> None:
+    actual_values = _make_inputs(rank, requires_grad=True)
+    reference_values = tuple(
+        item.detach().clone().requires_grad_(True) if item is not None else None
+        for item in actual_values
+    )
+    actual, actual_state = _run(actual_values, chunk_size=3)
+    q, k, value, gate, adt, dt, trap, D, mimo_x, mimo_z, mimo_out = reference_values
+    expected, expected_state = _recurrent_reference(
+        q,
+        k,
+        value,
+        gate,
+        adt,
+        dt,
+        trap,
         D,
-        z[:, 2048:],
+        mimo_x=mimo_x,
+        mimo_z=mimo_z,
+        mimo_out=mimo_out,
+    )
+    output_weight = torch.randn_like(actual)
+    state_weight = torch.randn_like(actual_state)
+    ((actual * output_weight).sum() + (actual_state * state_weight).sum()).backward()
+    ((expected * output_weight).sum() + (expected_state * state_weight).sum()).backward()
+    for actual_value, reference_value in zip(actual_values, reference_values):
+        if actual_value is not None:
+            torch.testing.assert_close(
+                actual_value.grad, reference_value.grad, rtol=2e-4, atol=3e-5
+            )
+
+
+@pytest.mark.parametrize("rank", [1, 4])
+def test_scan_state_can_continue_a_sequence(rank: int) -> None:
+    values = _make_inputs(rank)
+    q, k, value, gate, adt, dt, trap, D, mimo_x, mimo_z, mimo_out = values
+    split = 4
+    full, full_state = _run(values, chunk_size=3)
+
+    first_values = tuple(
+        item[:, :split] if index < 7 else item
+        for index, item in enumerate(values)
+    )
+    first, first_state = _run(first_values, chunk_size=3)
+    second, second_state = mamba3_scan(
+        q[:, split:],
+        k[:, split:],
+        value[:, split:],
+        gate[:, split:],
+        adt[:, split:],
+        dt[:, split:],
+        trap[:, split:],
+        D,
+        mimo_x=mimo_x,
+        mimo_z=mimo_z,
+        mimo_out=mimo_out,
+        chunk_size=3,
         initial_state=first_state,
-        return_state=True,
+        initial_k=k[:, split - 1].permute(0, 1, 2, 3),
+        initial_value=value[:, split - 1],
     )
-    torch.testing.assert_close(full, torch.cat((first, second), dim=1), rtol=2e-4, atol=2e-5)
-    torch.testing.assert_close(full_state, split_state, rtol=2e-4, atol=2e-5)
+    torch.testing.assert_close(torch.cat((first, second), dim=1), full, rtol=2e-5, atol=2e-6)
+    torch.testing.assert_close(second_state, full_state, rtol=2e-5, atol=2e-6)
+
+
+def test_empty_continued_scan_preserves_state() -> None:
+    batch, heads, rank, head_dim, d_state = 2, 3, 1, 4, 8
+    q = torch.empty(batch, 0, heads, rank, d_state)
+    value = torch.empty(batch, 0, heads, head_dim, requires_grad=True)
+    state = torch.randn(batch, heads, head_dim, d_state)
+    output, final_state = mamba3_scan(
+        q,
+        q,
+        value,
+        value,
+        torch.empty(batch, 0, heads),
+        torch.empty(batch, 0, heads),
+        torch.empty(batch, 0, heads),
+        torch.ones(heads),
+        initial_state=state,
+        initial_k=torch.randn(batch, heads, rank, d_state),
+        initial_value=torch.randn(batch, heads, head_dim),
+    )
+    assert output.shape == value.shape
+    torch.testing.assert_close(final_state, state)
+    output.sum().backward()
+    assert value.grad is not None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+@pytest.mark.parametrize("rank", [1, 4])
+def test_cuda_bfloat16_scan_uses_fp32_accumulation(rank: int) -> None:
+    values = list(_make_inputs(rank))
+    low_precision = {0, 1, 2, 3, 6}
+    values = [
+        item.cuda().to(torch.bfloat16 if index in low_precision else torch.float32)
+        if item is not None
+        else None
+        for index, item in enumerate(values)
+    ]
+    actual, actual_state = _run(tuple(values), chunk_size=3)
+    q, k, value, gate, adt, dt, trap, D, mimo_x, mimo_z, mimo_out = values
+    expected, expected_state = _recurrent_reference(
+        q,
+        k,
+        value,
+        gate,
+        adt,
+        dt,
+        trap,
+        D,
+        mimo_x=mimo_x,
+        mimo_z=mimo_z,
+        mimo_out=mimo_out,
+    )
+    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(actual_state, expected_state, rtol=3e-3, atol=3e-3)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_cuda_fp32_bmm_accumulation_survives_autocast_and_backward() -> None:
+    torch.manual_seed(50)
+    left = torch.randn(3, 5, 7, device="cuda", dtype=torch.bfloat16).requires_grad_()
+    right = torch.randn(3, 7, 4, device="cuda", dtype=torch.bfloat16).requires_grad_()
+    reference_left = left.detach().float().requires_grad_()
+    reference_right = right.detach().float().requires_grad_()
+    weight = torch.randn(3, 5, 4, device="cuda")
+
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        actual = _batched_matmul(left, right, accumulate_float=True)
+    expected = torch.bmm(reference_left, reference_right)
+    assert actual.dtype == torch.float32
+    torch.testing.assert_close(actual, expected, rtol=3e-3, atol=3e-3)
+    (actual * weight).sum().backward()
+    (expected * weight).sum().backward()
+    torch.testing.assert_close(
+        left.grad.float(), reference_left.grad, rtol=2e-2, atol=2e-2
+    )
+    torch.testing.assert_close(
+        right.grad.float(), reference_right.grad, rtol=2e-2, atol=2e-2
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+@pytest.mark.parametrize("rank", [1, 4])
+def test_cuda_bfloat16_scan_gradients_match_fp32_reference(rank: int) -> None:
+    actual_values = list(_make_inputs(rank))
+    low_precision = {0, 1, 2, 3, 6}
+    actual_values = tuple(
+        item.cuda()
+        .to(torch.bfloat16 if index in low_precision else torch.float32)
+        .requires_grad_(True)
+        if item is not None
+        else None
+        for index, item in enumerate(actual_values)
+    )
+    reference_values = tuple(
+        item.detach().clone().requires_grad_(True) if item is not None else None
+        for item in actual_values
+    )
+    actual, actual_state = _run(actual_values, chunk_size=3)
+    q, k, value, gate, adt, dt, trap, D, mimo_x, mimo_z, mimo_out = reference_values
+    expected, expected_state = _recurrent_reference(
+        q,
+        k,
+        value,
+        gate,
+        adt,
+        dt,
+        trap,
+        D,
+        mimo_x=mimo_x,
+        mimo_z=mimo_z,
+        mimo_out=mimo_out,
+    )
+    output_weight = torch.randn_like(actual)
+    state_weight = torch.randn_like(actual_state)
+    ((actual * output_weight).sum() + (actual_state * state_weight).sum()).backward()
+    ((expected * output_weight).sum() + (expected_state * state_weight).sum()).backward()
+    for actual_value, reference_value in zip(actual_values, reference_values):
+        if actual_value is not None:
+            torch.testing.assert_close(
+                actual_value.grad.float(),
+                reference_value.grad.float(),
+                rtol=5e-2,
+                atol=5e-2,
+            )

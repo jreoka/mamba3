@@ -1,15 +1,15 @@
 [build-system]
-requires = ["setuptools>=69", "wheel"]
+requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "mamba3"
-version = "0.1.0"
-description = "A compact selective state-space sequence model with fused CUDA kernels"
+version = "0.2.0"
+description = "A faithful, optimized PyTorch Mamba-3 mixer stack"
 readme = "README.md"
 requires-python = ">=3.10"
-license = "MIT"
-license-files = ["LICENSE"]
+license = "MIT AND Apache-2.0"
+license-files = ["LICENSE", "LICENSE-APACHE", "NOTICE"]
 authors = [{ name = "jreoka" }]
 keywords = ["mamba", "state-space-model", "sequence-model", "pytorch", "cuda"]
 classifiers = [
@@ -18,7 +18,7 @@ classifiers = [
   "Programming Language :: Python :: 3 :: Only",
   "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
-dependencies = ["torch>=2.2"]
+dependencies = ["torch>=2.8"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "build>=1.2"]
@@ -31,9 +31,9 @@ Issues = "https://github.com/jreoka/mamba3/issues"
 [tool.setuptools.packages.find]
 include = ["mamba3*"]
 
-[tool.setuptools.package-data]
-mamba3 = ["csrc/*.cpp", "csrc/*.cu"]
-
 [tool.pytest.ini_options]
 addopts = "-ra"
 testpaths = ["tests"]
+filterwarnings = [
+  "ignore:AnnAssign.__init__ missing.*:DeprecationWarning:triton.compiler.code_generator",
+]

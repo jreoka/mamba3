@@ -1,1 +1,2 @@
 recursive-include benchmarks *.py
+include NOTICE

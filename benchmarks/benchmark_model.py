@@ -5,8 +5,8 @@ import statistics
 
 import torch
 
+import mamba3.ops as mamba3_ops
 from mamba3 import Mamba3
-from mamba3.ops import load_cuda_extension
 
 
 def elapsed_ms(function, warmup: int, iterations: int) -> float:
@@ -26,16 +26,16 @@ def elapsed_ms(function, warmup: int, iterations: int) -> float:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Benchmark a complete Mamba3 model")
+    parser = argparse.ArgumentParser(description="Benchmark a complete Mamba-3 stack")
     parser.add_argument("--batch", type=int, default=8)
     parser.add_argument("--length", type=int, default=2048)
     parser.add_argument("--d-model", type=int, default=512)
-    parser.add_argument("--d-state", type=int, default=16)
+    parser.add_argument("--d-state", type=int, default=128)
     parser.add_argument("--depth", type=int, default=1)
+    parser.add_argument("--mimo-rank", type=int, default=1)
     parser.add_argument("--iterations", type=int, default=20)
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--training", action="store_true")
-    parser.add_argument("--bidirectional", action="store_true")
     parser.add_argument("--decode", action="store_true")
     parser.add_argument("--cuda-graph", action="store_true")
     parser.add_argument(
@@ -45,28 +45,28 @@ def main() -> None:
 
     if args.cuda_graph:
         args.decode = True
-    if args.decode and (args.training or args.bidirectional):
-        parser.error("--decode requires causal inference")
-
+    if args.decode and args.training:
+        parser.error("--decode and --training are mutually exclusive")
     if not torch.cuda.is_available():
         raise SystemExit("CUDA is required for this benchmark")
-    if load_cuda_extension(verbose=True) is None:
-        raise SystemExit("CUDA extension could not be built")
 
     dtype = getattr(torch, args.dtype)
     model = Mamba3(
         d_model=args.d_model,
         d_state=args.d_state,
         depth=args.depth,
-        causal=not args.bidirectional,
-    ).cuda().to(dtype=dtype)
+        mimo_rank=args.mimo_rank,
+    ).cuda()
+    if not args.training:
+        model = model.to(dtype=dtype)
     model.train(args.training)
+    input_dtype = torch.float32 if args.training else dtype
     x = torch.randn(
         args.batch,
         args.length,
         args.d_model,
         device="cuda",
-        dtype=dtype,
+        dtype=input_dtype,
         requires_grad=args.training,
     )
 
@@ -88,7 +88,11 @@ def main() -> None:
     elif args.training:
 
         def step() -> None:
-            model(x).float().square().mean().backward()
+            with torch.autocast(
+                "cuda", dtype=dtype, enabled=dtype != torch.float32
+            ):
+                loss = model(x).float().square().mean()
+            loss.backward()
             model.zero_grad(set_to_none=True)
             x.grad = None
 
@@ -107,16 +111,21 @@ def main() -> None:
     print(f"device: {torch.cuda.get_device_name()}")
     print(
         f"shape: B={args.batch}, L={args.length}, D={args.d_model}, "
-        f"N={args.d_state}, depth={args.depth}"
+        f"N={args.d_state}, depth={args.depth}, rank={args.mimo_rank}"
     )
+    if args.cuda_graph:
+        backend = "cuda-graph"
+    elif args.decode and mamba3_ops._TRITON_LAST_DISPATCH:
+        backend = "triton"
+    else:
+        backend = "pytorch"
     print(
-        f"mode/direction/dtype: "
+        f"mode/dtype/backend: "
         f"{'decode' if args.decode else 'training' if args.training else 'inference'} / "
-        f"{'bidirectional' if args.bidirectional else 'causal'} / {args.dtype} / "
-        f"{'cuda-graph' if args.cuda_graph else 'eager'}"
+        f"{args.dtype} / {backend}"
     )
     print(f"model: {latency:.3f} ms ({tokens / (latency / 1000):,.0f} tokens/s)")
-    print(f"peak incremental memory: {peak_memory / (1024 ** 2):.1f} MiB")
+    print(f"peak incremental memory: {peak_memory / (1024**2):.1f} MiB")
 
 
 if __name__ == "__main__":

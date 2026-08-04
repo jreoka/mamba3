@@ -195,15 +195,39 @@ class _BmmFloat(torch.autograd.Function):
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         left, right = ctx.saved_tensors
         grad_left = grad_right = None
+        low_precision_cuda = (
+            left.is_cuda
+            and left.dtype in (torch.float16, torch.bfloat16)
+            and right.dtype == left.dtype
+            and _BMM_OUT_DTYPE_SUPPORTED
+        )
         with torch.autocast(left.device.type, enabled=False):
-            if ctx.needs_input_grad[0]:
-                grad_left = torch.bmm(
-                    grad_output.float(), right.float().transpose(1, 2)
-                ).to(left.dtype)
-            if ctx.needs_input_grad[1]:
-                grad_right = torch.bmm(
-                    left.float().transpose(1, 2), grad_output.float()
-                ).to(right.dtype)
+            if low_precision_cuda:
+                # Mirror the forward: low-precision tensor-core GEMMs with
+                # FP32 accumulation. Only the incoming FP32 gradient needs a
+                # precision-preserving cast; the operands are already low
+                # precision.
+                if ctx.needs_input_grad[0]:
+                    grad_left = torch.bmm(
+                        grad_output.to(left.dtype),
+                        right.transpose(1, 2),
+                        out_dtype=torch.float32,
+                    ).to(left.dtype)
+                if ctx.needs_input_grad[1]:
+                    grad_right = torch.bmm(
+                        left.transpose(1, 2),
+                        grad_output.to(right.dtype),
+                        out_dtype=torch.float32,
+                    ).to(right.dtype)
+            else:
+                if ctx.needs_input_grad[0]:
+                    grad_left = torch.bmm(
+                        grad_output.float(), right.float().transpose(1, 2)
+                    ).to(left.dtype)
+                if ctx.needs_input_grad[1]:
+                    grad_right = torch.bmm(
+                        left.float().transpose(1, 2), grad_output.float()
+                    ).to(right.dtype)
         return grad_left, grad_right
 
 
@@ -341,6 +365,10 @@ def mamba3_scan(
         dim=1,
     )
     scale = gamma + next_endpoint
+    # The chunk states compose only when ``scale`` carries the next token's
+    # left trapezoid endpoint; same-token outputs must see only gamma. Folding
+    # the ratio into the decay diagonal below makes both true at once.
+    diag_decay = gamma / scale
     mimo_x_activation = mimo_x.to(value.dtype) if mimo_x is not None else None
     mimo_z_activation = mimo_z.to(gate.dtype) if mimo_z is not None else None
     mimo_out_float = mimo_out.float() if mimo_out is not None else None
@@ -364,31 +392,30 @@ def mamba3_scan(
         dtype=torch.bool,
         device=q.device,
     ).tril()
+    # Expansion, bias, and rotation act per token, so they are hoisted out of
+    # the chunk loop; every chunk then starts from a simple slice.
+    if qk_heads == 1 and heads != 1:
+        q_full = q.expand(-1, -1, heads, -1, -1)
+        k_full = k.expand(-1, -1, heads, -1, -1)
+    elif qk_heads != heads:
+        repeats = heads // qk_heads
+        q_full = q.repeat_interleave(repeats, dim=2)
+        k_full = k.repeat_interleave(repeats, dim=2)
+    else:
+        q_full = q
+        k_full = k
+    if q_bias is not None:
+        q_full = q_full + q_bias_activation[None, None]
+        k_full = k_full + k_bias_activation[None, None]
+    if phase is not None:
+        q_full, k_full = rotate_qk(q_full, k_full, phase, mimo=mimo_rotation)
+
     for start in range(0, length, chunk_size):
         end = min(start + chunk_size, length)
         width = end - start
 
-        q_tokens = q[:, start:end]
-        k_tokens = k[:, start:end]
-        if qk_heads == 1 and heads != 1:
-            q_tokens = q_tokens.expand(-1, -1, heads, -1, -1)
-            k_tokens = k_tokens.expand(-1, -1, heads, -1, -1)
-        elif qk_heads != heads:
-            repeats = heads // qk_heads
-            q_tokens = q_tokens.repeat_interleave(repeats, dim=2)
-            k_tokens = k_tokens.repeat_interleave(repeats, dim=2)
-        if q_bias is not None:
-            q_tokens = q_tokens + q_bias_activation[None, None]
-            k_tokens = k_tokens + k_bias_activation[None, None]
-        if phase is not None:
-            q_tokens, k_tokens = rotate_qk(
-                q_tokens,
-                k_tokens,
-                phase[:, start:end],
-                mimo=mimo_rotation,
-            )
-        q_chunk = q_tokens.permute(0, 2, 1, 3, 4)
-        k_chunk = k_tokens.permute(0, 2, 1, 3, 4)
+        q_chunk = q_full[:, start:end].permute(0, 2, 1, 3, 4)
+        k_chunk = k_full[:, start:end].permute(0, 2, 1, 3, 4)
         base_value_chunk = value[:, start:end].permute(0, 2, 1, 3)
         base_gate_chunk = gate[:, start:end].permute(0, 2, 1, 3)
         if mimo_x is None:
@@ -405,7 +432,6 @@ def mamba3_scan(
             )
         adt_chunk = adt[:, start:end].permute(0, 2, 1).float()
         scale_chunk = scale[:, start:end].permute(0, 2, 1)
-        next_chunk = next_endpoint[:, start:end].permute(0, 2, 1)
 
         cumulative = torch.cumsum(adt_chunk, dim=-1)
         prefix_decay = torch.exp(cumulative)
@@ -416,22 +442,33 @@ def mamba3_scan(
         value_flat = value_chunk.flatten(2, 3)
 
         # Contribution from all earlier chunks.
-        inter = _batched_matmul(
-            state.to(dtype=q.dtype),
-            q_flat.transpose(-1, -2),
-            accumulate_float=True,
-        ).transpose(-1, -2)
-        inter = inter.reshape(batch, heads, width, rank, head_dim)
-        inter = inter * prefix_decay[..., None, None]
+        if start == 0 and initial_state is None and not endpoint_cache:
+            inter = torch.zeros(
+                batch, heads, width, rank, head_dim, device=q.device
+            )
+        else:
+            inter = _batched_matmul(
+                state.to(dtype=q.dtype),
+                q_flat.transpose(-1, -2),
+                accumulate_float=True,
+            ).transpose(-1, -2)
+            inter = inter.reshape(batch, heads, width, rank, head_dim)
+            inter = inter * prefix_decay[..., None, None]
 
         # Contributions within this chunk. Rank is flattened into the token
         # axis so one GEMM handles both SISO and MIMO cross-rank interactions.
         scores = _batched_matmul(
             q_flat, k_flat.transpose(-1, -2), accumulate_float=True
         )
-        decay = cumulative.unsqueeze(-1) - cumulative.unsqueeze(-2)
         causal = causal_mask[:width, :width]
-        decay = torch.exp(decay.masked_fill(~causal, -torch.inf))
+        decay = torch.exp(cumulative.unsqueeze(-1) - cumulative.unsqueeze(-2))
+        decay = decay.masked_fill(~causal, 0.0)
+        # ``scale`` includes the next token's left endpoint so chunk states
+        # compose; the diagonal is set to gamma/scale so that the same-token
+        # output sees exactly gamma without a separate correction GEMM.
+        decay.diagonal(0, -2, -1).copy_(
+            diag_decay[:, start:end].permute(0, 2, 1)
+        )
         scores = scores.reshape(batch, heads, width, rank, width, rank)
         weighted_scores = (
             scores * decay[:, :, :, None, :, None]
@@ -440,21 +477,7 @@ def mamba3_scan(
             weighted_scores, value_flat, accumulate_float=True
         ).reshape(batch, heads, width, rank, head_dim)
 
-        # ``scale`` includes the next token's left trapezoid endpoint so that
-        # chunk states compose. Remove that future endpoint from same-token
-        # outputs, where only gamma is valid.
-        same_token_scores = _batched_matmul(
-            q_chunk, k_chunk.transpose(-1, -2), accumulate_float=True
-        )
-        correction = _batched_matmul(
-            same_token_scores.to(value_chunk.dtype),
-            value_chunk,
-            accumulate_float=True,
-        )
-        correction = correction * next_chunk[..., None, None]
-
         mixed = inter + intra
-        mixed = mixed - correction
         mixed = mixed + D_float[None, :, None, None, None] * value_chunk.float()
 
         mixed = mixed * F.silu(gate_chunk.float())

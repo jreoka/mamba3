@@ -19,6 +19,9 @@ _EXPANSION = 2
 _CANONICAL_HEAD_DIM = 64
 _ROPE_FRACTION = 0.5
 _A_FLOOR = 1e-4
+# Phase accumulation is kept in smaller chunks than the scan: the unbounded
+# pre-fmod partial sums would otherwise lose FP32 precision at long context.
+_PHASE_CHUNK = 64
 
 _LayerCache = tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
 
@@ -54,7 +57,11 @@ class _Mamba3Mixer(nn.Module):
         self.nheads = self.d_inner // self.headdim
         self.ngroups = 1
         self.num_angles = int(d_state * _ROPE_FRACTION) // 2
-        self.chunk_size = 64 if mimo_rank == 1 else max(8, 64 // mimo_rank)
+        # The chunked SSD is chunk-size invariant (each chunk carries the
+        # exact recurrence), so a large chunk is used to cut per-chunk kernel
+        # and graph overhead; MIMO is capped lower to bound the rank-expanded
+        # intra-chunk GEMM memory.
+        self.chunk_size = 256 if mimo_rank == 1 else max(16, 128 // mimo_rank)
 
         projection_size = (
             2 * self.d_inner
@@ -181,8 +188,8 @@ class _Mamba3Mixer(nn.Module):
             else initial_phase
         )
         phase_chunks = []
-        for start in range(0, increments.shape[1], self.chunk_size):
-            chunk = increments[:, start : start + self.chunk_size]
+        for start in range(0, increments.shape[1], _PHASE_CHUNK):
+            chunk = increments[:, start : start + _PHASE_CHUNK]
             current = torch.fmod(
                 torch.cumsum(chunk, dim=1) + phase_state.unsqueeze(1),
                 2.0 * math.pi,

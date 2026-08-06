@@ -3,8 +3,10 @@
 A compact, faithful implementation of the
 [Mamba-3](https://arxiv.org/abs/2603.15569) sequence mixer for PyTorch. It
 includes canonical SISO Mamba-3, rank-4 MIMO, a differentiable CPU/CUDA
-backend, constant-memory decoding, and an automatically fused CUDA decode
-path when Triton is available.
+backend, constant-memory decoding, and automatically fused CUDA kernels for
+both the chunked SSD (training and prefill) and decoding when Triton is
+available. The fused kernels implement the exact same recurrence with fewer,
+larger launches.
 
 ## Install
 
@@ -52,6 +54,14 @@ with torch.autocast("cuda", dtype=torch.bfloat16):
     y = model(x)
 ```
 
+`torch.compile` fuses the per-chunk elementwise chains of the scan on top of
+the cuBLAS GEMMs; the recurrence and the FP32 state/phase handling are
+unchanged:
+
+```python
+model.compile()  # returns the same model with an optimized forward
+```
+
 ## Generation
 
 Build all four recurrent states from a prefix once, then process one token at
@@ -74,8 +84,10 @@ next_output = decoder(next_x.cuda())
 decoder.reset()  # begin a new sequence
 ```
 
-The fused Triton SISO kernel is selected automatically for canonical power-of-
-two CUDA shapes. Set `MAMBA3_DISABLE_TRITON=1` to force the PyTorch path.
+The fused Triton kernels are selected automatically for supported low-
+precision CUDA shapes: the chunked SSD (one launch per chunk for both the
+token outputs and the state update) and the SISO/MIMO decode step. Set
+`MAMBA3_DISABLE_TRITON=1` to force the portable PyTorch path.
 
 ## What Is Implemented
 
@@ -108,7 +120,8 @@ S_t = alpha * S_(t-1) + beta * U_(t-1) + gamma * U_t
 
 where `U_t` is the rank-1 SISO or rank-R MIMO outer-product input. Full
 sequences use a chunked SSD formulation that uses tensor cores on supported
-low-precision CUDA hardware; decoding uses the mathematically identical
+low-precision CUDA hardware (inference/prefill collapses each chunk into two
+fused Triton launches); decoding uses the mathematically identical
 recurrence with FP32 state.
 
 ## Development

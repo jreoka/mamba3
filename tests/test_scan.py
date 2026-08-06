@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib.util
 import math
 
 import pytest
@@ -378,4 +379,57 @@ def test_cuda_bfloat16_scan_gradients_match_fp32_reference(rank: int) -> None:
                 reference_value.grad.float(),
                 rtol=5e-2,
                 atol=5e-2,
+            )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+@pytest.mark.skipif(importlib.util.find_spec("triton") is None, reason="Triton is unavailable")
+@pytest.mark.parametrize("rank", [1, 4])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_fused_chunked_scan_matches_pytorch_path(
+    monkeypatch: pytest.MonkeyPatch, rank: int, dtype: torch.dtype
+) -> None:
+    import mamba3.ops as ops
+    from mamba3 import Mamba3
+
+    torch.manual_seed(11 + rank)
+    model = Mamba3(64, d_state=16, depth=1, mimo_rank=rank).cuda().to(dtype).eval()
+    x = torch.randn(2, 37, 64, device="cuda", dtype=dtype)
+
+    monkeypatch.setenv("MAMBA3_DISABLE_TRITON", "1")
+    with torch.inference_mode():
+        reference = model(x)
+        prefix, reference_cache = model.prefill(x[:, :9])
+        continued = [prefix]
+        for index in range(9, 37):
+            output, reference_cache = model.step(
+                x[:, index : index + 1], reference_cache
+            )
+            continued.append(output)
+        continued = torch.cat(continued, dim=1)
+    monkeypatch.delenv("MAMBA3_DISABLE_TRITON")
+
+    with torch.inference_mode():
+        actual = model(x)
+        prefix, actual_cache = model.prefill(x[:, :9])
+        actual_continued = [prefix]
+        for index in range(9, 37):
+            output, actual_cache = model.step(
+                x[:, index : index + 1], actual_cache
+            )
+            actual_continued.append(output)
+        actual_continued = torch.cat(actual_continued, dim=1)
+
+    assert ops._TRITON_LAST_SCAN_DISPATCH
+    torch.testing.assert_close(actual, reference, rtol=3e-2, atol=3e-2)
+    torch.testing.assert_close(
+        actual_continued, continued, rtol=3e-2, atol=3e-2
+    )
+    for reference_layer, actual_layer in zip(reference_cache, actual_cache):
+        for reference_tensor, actual_tensor in zip(reference_layer, actual_layer):
+            torch.testing.assert_close(
+                actual_tensor.float(),
+                reference_tensor.float(),
+                rtol=3e-2,
+                atol=3e-2,
             )

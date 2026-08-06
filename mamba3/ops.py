@@ -12,6 +12,10 @@ _TRITON_STEP = None
 _TRITON_STEP_CHECKED = False
 _TRITON_FAILURES: set[tuple[object, ...]] = set()
 _TRITON_LAST_DISPATCH = False
+_TRITON_SCAN = None
+_TRITON_SCAN_CHECKED = False
+_TRITON_SCAN_FAILURES: set[tuple[object, ...]] = set()
+_TRITON_LAST_SCAN_DISPATCH = False
 try:
     _TORCH_VERSION = tuple(
         int(part) for part in torch.__version__.split("+", 1)[0].split(".")[:2]
@@ -80,7 +84,7 @@ def rotate_qk(
     return rotate(q), rotate(k)
 
 
-def fused_siso_step(
+def fused_step(
     q: torch.Tensor,
     k: torch.Tensor,
     value: torch.Tensor,
@@ -91,6 +95,10 @@ def fused_siso_step(
     angle_rate: torch.Tensor,
     D: torch.Tensor,
     cache: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+    *,
+    mimo_x: torch.Tensor | None = None,
+    mimo_z: torch.Tensor | None = None,
+    mimo_out: torch.Tensor | None = None,
 ) -> tuple[
     torch.Tensor,
     tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
@@ -99,6 +107,7 @@ def fused_siso_step(
 
     global _TRITON_STEP, _TRITON_STEP_CHECKED, _TRITON_LAST_DISPATCH
     _TRITON_LAST_DISPATCH = False
+    rank = q.shape[2]
     d_state = q.shape[-1]
     head_dim = value.shape[-1]
     failure_key = (
@@ -115,6 +124,7 @@ def fused_siso_step(
         tuple(tensor.dtype for tensor in cache),
         d_state,
         head_dim,
+        rank,
         cache[0].shape[-1],
     )
     supported_shape = (
@@ -122,7 +132,13 @@ def fused_siso_step(
         and head_dim >= 16
         and d_state & (d_state - 1) == 0
         and head_dim & (head_dim - 1) == 0
+        and rank & (rank - 1) == 0
+        and 1 <= rank <= 8
         and cache[0].shape[-1] <= d_state // 2
+        and (rank == 1 or 4 * cache[0].shape[-1] == d_state)
+        and (rank == 1)
+        == (mimo_x is None)
+        and cache[2].shape[2:] == (rank, d_state)
         and cache[2].dtype == q.dtype
         and cache[3].dtype == value.dtype
     )
@@ -139,9 +155,9 @@ def fused_siso_step(
     if not _TRITON_STEP_CHECKED:
         _TRITON_STEP_CHECKED = True
         try:
-            from ._triton import siso_step
+            from ._triton import fused_step as _fused_triton_step
 
-            _TRITON_STEP = siso_step
+            _TRITON_STEP = _fused_triton_step
         except Exception:  # pragma: no cover - optional runtime import
             _TRITON_STEP = None
     if _TRITON_STEP is None:
@@ -158,6 +174,9 @@ def fused_siso_step(
             angle_rate,
             D,
             cache,
+            mimo_x=mimo_x,
+            mimo_z=mimo_z,
+            mimo_out=mimo_out,
         )
         _TRITON_LAST_DISPATCH = True
         return result
@@ -229,6 +248,261 @@ class _BmmFloat(torch.autograd.Function):
                         left.float().transpose(1, 2), grad_output.float()
                     ).to(right.dtype)
         return grad_left, grad_right
+
+
+def _fused_chunk_scan(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    value: torch.Tensor,
+    gate: torch.Tensor,
+    adt: torch.Tensor,
+    dt: torch.Tensor,
+    trap_logits: torch.Tensor,
+    D: torch.Tensor,
+    *,
+    mimo_x: torch.Tensor | None,
+    mimo_z: torch.Tensor | None,
+    mimo_out: torch.Tensor | None,
+    chunk_size: int,
+    initial_state: torch.Tensor | None,
+    initial_k: torch.Tensor | None,
+    initial_value: torch.Tensor | None,
+    phase: torch.Tensor | None,
+    mimo_rotation: bool,
+    q_bias: torch.Tensor | None,
+    k_bias: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Run the chunked SSD as one fused Triton launch per chunk.
+
+    Returns ``None`` when the runtime or shapes are unsupported, leaving the
+    portable PyTorch path in charge. Mathematically identical to
+    ``mamba3_scan``: same trapezoid discretization, same diagonal fold, same
+    causal decay kernel, same FP32 state recurrence. Only the low-precision
+    GEMMs differ (they already use tensor cores with FP32 accumulation).
+    """
+
+    global _TRITON_SCAN, _TRITON_SCAN_CHECKED, _TRITON_LAST_SCAN_DISPATCH
+    _TRITON_LAST_SCAN_DISPATCH = False
+    batch, length, qk_heads, rank, d_state = q.shape
+    heads = value.shape[2]
+    head_dim = value.shape[-1]
+    failure_key = (
+        q.device,
+        q.dtype,
+        k.dtype,
+        value.dtype,
+        gate.dtype,
+        adt.dtype,
+        dt.dtype,
+        trap_logits.dtype,
+        D.dtype,
+        d_state,
+        head_dim,
+        rank,
+        chunk_size,
+    )
+    supported = (
+        not torch.is_grad_enabled()
+        and q.is_cuda
+        and q.dtype in (torch.float16, torch.bfloat16)
+        and k.dtype == value.dtype == gate.dtype == q.dtype
+        and adt.dtype == torch.float32
+        and d_state >= 16
+        and head_dim >= 16
+        and d_state & (d_state - 1) == 0
+        and head_dim & (head_dim - 1) == 0
+        and rank & (rank - 1) == 0
+        and 1 <= rank <= 8
+        and chunk_size * rank <= 1024
+        and (rank > 1) == (mimo_x is not None)
+        and failure_key not in _TRITON_SCAN_FAILURES
+        and os.getenv("MAMBA3_DISABLE_TRITON", "0") != "1"
+    )
+    if not supported:
+        return None
+    if not _TRITON_SCAN_CHECKED:
+        _TRITON_SCAN_CHECKED = True
+        try:
+            from ._triton import chunk_main, chunk_state
+
+            _TRITON_SCAN = (chunk_main, chunk_state)
+        except Exception:  # pragma: no cover - optional runtime import
+            _TRITON_SCAN = None
+    if _TRITON_SCAN is None:
+        return None
+    chunk_main, chunk_state = _TRITON_SCAN
+    try:
+        result = _fused_chunk_scan_impl(
+            chunk_main,
+            chunk_state,
+            q,
+            k,
+            value,
+            gate,
+            adt,
+            dt,
+            trap_logits,
+            D,
+            mimo_x=mimo_x,
+            mimo_z=mimo_z,
+            mimo_out=mimo_out,
+            chunk_size=chunk_size,
+            initial_state=initial_state,
+            initial_k=initial_k,
+            initial_value=initial_value,
+            phase=phase,
+            mimo_rotation=mimo_rotation,
+            q_bias=q_bias,
+            k_bias=k_bias,
+        )
+        _TRITON_LAST_SCAN_DISPATCH = True
+        return result
+    except Exception as error:  # pragma: no cover - backend and toolchain dependent
+        _TRITON_SCAN_FAILURES.add(failure_key)
+        warnings.warn(
+            f"fused Mamba-3 chunked scan is unavailable; using PyTorch ({error})",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return None
+
+
+def _fused_chunk_scan_impl(
+    chunk_main,
+    chunk_state,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    value: torch.Tensor,
+    gate: torch.Tensor,
+    adt: torch.Tensor,
+    dt: torch.Tensor,
+    trap_logits: torch.Tensor,
+    D: torch.Tensor,
+    *,
+    mimo_x: torch.Tensor | None,
+    mimo_z: torch.Tensor | None,
+    mimo_out: torch.Tensor | None,
+    chunk_size: int,
+    initial_state: torch.Tensor | None,
+    initial_k: torch.Tensor | None,
+    initial_value: torch.Tensor | None,
+    phase: torch.Tensor | None,
+    mimo_rotation: bool,
+    q_bias: torch.Tensor | None,
+    k_bias: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    batch, length, qk_heads, rank, d_state = q.shape
+    heads = value.shape[2]
+    head_dim = value.shape[-1]
+    device = value.device
+
+    trap = torch.sigmoid(trap_logits.float())
+    gamma = dt * trap
+    next_endpoint = torch.cat(
+        (dt[:, 1:] * (1.0 - trap[:, 1:]), torch.zeros_like(dt[:, :1])),
+        dim=1,
+    )
+    scale = gamma + next_endpoint
+    diag_decay = gamma / scale
+
+    if initial_state is None:
+        state = torch.zeros(
+            (batch, heads, head_dim, d_state), device=device, dtype=torch.float32
+        )
+    else:
+        state = initial_state.float()
+
+    if initial_k is not None:
+        previous_rank_value = _rank_values(
+            initial_value.unsqueeze(1), mimo_x
+        ).squeeze(1)
+        previous_outer = _outer_sum(previous_rank_value, initial_k)
+        state = state + (
+            dt[:, 0] * (1.0 - trap[:, 0])
+        ).unsqueeze(-1).unsqueeze(-1) * previous_outer
+
+    if qk_heads == 1 and heads != 1:
+        q_full = q.expand(-1, -1, heads, -1, -1)
+        k_full = k.expand(-1, -1, heads, -1, -1)
+    elif qk_heads != heads:
+        repeats = heads // qk_heads
+        q_full = q.repeat_interleave(repeats, dim=2)
+        k_full = k.repeat_interleave(repeats, dim=2)
+    else:
+        q_full = q
+        k_full = k
+    if q_bias is not None:
+        q_full = q_full + q_bias.to(q.dtype)[None, None]
+        k_full = k_full + k_bias.to(k.dtype)[None, None]
+    if phase is not None:
+        q_full, k_full = rotate_qk(q_full, k_full, phase, mimo=mimo_rotation)
+
+    D_float = D.float()
+    output = torch.empty(
+        (batch, length, heads, head_dim), device=device, dtype=value.dtype
+    )
+    for start in range(0, length, chunk_size):
+        end = min(start + chunk_size, length)
+        width = end - start
+
+        q_chunk = q_full[:, start:end].permute(0, 2, 1, 3, 4)
+        k_chunk = k_full[:, start:end].permute(0, 2, 1, 3, 4)
+        base_value_chunk = value[:, start:end].permute(0, 2, 1, 3)
+        base_gate_chunk = gate[:, start:end].permute(0, 2, 1, 3)
+        if mimo_x is None:
+            value_chunk = base_value_chunk.unsqueeze(3)
+            gate_chunk = base_gate_chunk.unsqueeze(3)
+        else:
+            value_chunk = (
+                base_value_chunk.unsqueeze(3)
+                * mimo_x.to(value.dtype)[None, :, None]
+            )
+            gate_chunk = (
+                base_gate_chunk.unsqueeze(3)
+                * mimo_z.to(gate.dtype)[None, :, None]
+            )
+        cumulative = torch.cumsum(adt[:, start:end].float(), dim=1)
+        scale_chunk = scale[:, start:end]
+        diag_chunk = diag_decay[:, start:end]
+
+        mixed = torch.empty(
+            (batch, heads, width, rank, head_dim),
+            device=device,
+            dtype=value.dtype,
+        )
+        chunk_main(
+            q_chunk,
+            k_chunk,
+            value_chunk,
+            gate_chunk,
+            cumulative,
+            scale_chunk,
+            diag_chunk,
+            D_float,
+            state,
+            mixed,
+            width=width,
+            rank=rank,
+        )
+        if mimo_out is not None:
+            mixed = (mixed * mimo_out.to(value.dtype)[None, :, None]).sum(dim=3)
+        else:
+            mixed = mixed.squeeze(3)
+        output[:, start:end] = mixed.permute(0, 2, 1, 3)
+
+        next_state = torch.empty_like(state)
+        chunk_state(
+            k_chunk,
+            value_chunk,
+            cumulative,
+            scale_chunk,
+            state,
+            next_state,
+            width=width,
+            rank=rank,
+        )
+        state = next_state
+    return output, state
 
 
 def _batched_matmul(
@@ -358,6 +632,30 @@ def mamba3_scan(
     if length == 0:
         return value.clone(), state
 
+    fused = _fused_chunk_scan(
+        q,
+        k,
+        value,
+        gate,
+        adt,
+        dt,
+        trap_logits,
+        D,
+        mimo_x=mimo_x,
+        mimo_z=mimo_z,
+        mimo_out=mimo_out,
+        chunk_size=chunk_size,
+        initial_state=initial_state,
+        initial_k=initial_k,
+        initial_value=initial_value,
+        phase=phase,
+        mimo_rotation=mimo_rotation,
+        q_bias=q_bias,
+        k_bias=k_bias,
+    )
+    if fused is not None:
+        return fused
+
     trap = torch.sigmoid(trap_logits.float())
     gamma = dt * trap
     next_endpoint = torch.cat(
@@ -392,6 +690,9 @@ def mamba3_scan(
         dtype=torch.bool,
         device=q.device,
     ).tril()
+    identity_mask = torch.eye(
+        min(length, chunk_size), dtype=torch.bool, device=q.device
+    )
     # Expansion, bias, and rotation act per token, so they are hoisted out of
     # the chunk loop; every chunk then starts from a simple slice.
     if qk_heads == 1 and heads != 1:
@@ -474,7 +775,7 @@ def mamba3_scan(
         # output sees exactly gamma without a separate correction GEMM.
         diagonal = diag_decay[:, start:end].permute(0, 2, 1)
         decay = torch.where(
-            torch.eye(width, dtype=torch.bool, device=decay.device)[None, None],
+            identity_mask[:width, :width][None, None],
             diagonal.unsqueeze(-1),
             decay,
         )

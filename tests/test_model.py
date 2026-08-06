@@ -386,3 +386,72 @@ def test_fused_triton_siso_step_matches_pytorch(
             torch.testing.assert_close(
                 fused_state, reference_state, rtol=rtol, atol=atol
             )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+@pytest.mark.skipif(importlib.util.find_spec("triton") is None, reason="Triton is unavailable")
+def test_fused_triton_mimo_step_matches_pytorch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    torch.manual_seed(8)
+    model = Mamba3(64, d_state=16, depth=1, mimo_rank=4).cuda().eval()
+    x = torch.randn(2, 7, 64, device="cuda", dtype=torch.float32)
+    monkeypatch.setenv("MAMBA3_DISABLE_TRITON", "1")
+    reference_cache = None
+    reference = []
+    with torch.inference_mode():
+        for index in range(x.shape[1]):
+            output, reference_cache = model.step(
+                x[:, index : index + 1], reference_cache
+            )
+            reference.append(output)
+
+    monkeypatch.delenv("MAMBA3_DISABLE_TRITON")
+    fused_cache = None
+    fused = []
+    with torch.inference_mode():
+        for index in range(x.shape[1]):
+            output, fused_cache = model.step(x[:, index : index + 1], fused_cache)
+            fused.append(output)
+
+    import mamba3.ops as ops
+
+    assert ops._TRITON_LAST_DISPATCH
+    torch.testing.assert_close(
+        torch.cat(fused, dim=1),
+        torch.cat(reference, dim=1),
+        rtol=2e-4,
+        atol=2e-5,
+    )
+    for reference_layer, fused_layer in zip(reference_cache, fused_cache):
+        for reference_state, fused_state in zip(reference_layer, fused_layer):
+            torch.testing.assert_close(
+                fused_state, reference_state, rtol=2e-4, atol=2e-5
+            )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+@pytest.mark.skipif(importlib.util.find_spec("triton") is None, reason="Triton is unavailable")
+def test_compiled_forward_matches_eager() -> None:
+    torch.manual_seed(9)
+    model = Mamba3(64, d_state=16, depth=2, mimo_rank=4).cuda()
+    x = torch.randn(2, 9, 64, device="cuda", requires_grad=True)
+    reference = model(x)
+    reference.square().mean().backward()
+    reference_grads = [
+        parameter.grad.clone() if parameter.grad is not None else None
+        for parameter in model.parameters()
+    ]
+
+    model.zero_grad(set_to_none=True)
+    compiled = model.compile()
+    assert compiled is model
+    actual = model(x)
+    torch.testing.assert_close(actual, reference, rtol=1e-5, atol=1e-6)
+    actual.square().mean().backward()
+    for actual_grad, reference_grad in zip(
+        (parameter.grad for parameter in model.parameters()), reference_grads
+    ):
+        if reference_grad is not None:
+            assert actual_grad is not None
+            torch.testing.assert_close(actual_grad, reference_grad, rtol=1e-4, atol=1e-5)

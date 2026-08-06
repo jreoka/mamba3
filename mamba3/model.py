@@ -7,7 +7,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from .ops import (
-    fused_siso_step,
+    fused_step,
     heavy_tail_activation,
     mamba3_scan,
     mamba3_step,
@@ -337,22 +337,24 @@ class _Mamba3Mixer(nn.Module):
             )
         else:
             self._validate_cache(cache, hidden_states.shape[0])
-        if self.mimo_rank == 1:
-            fused = fused_siso_step(
-                q[:, 0, :, 0],
-                k[:, 0, :, 0],
-                x[:, 0],
-                z[:, 0],
-                adt[:, 0],
-                dt[:, 0],
-                trap[:, 0],
-                angles[:, 0],
-                self.D,
-                cache,
-            )
-            if fused is not None:
-                mixed, next_cache = fused
-                return self.out_proj(mixed.flatten(-2)).unsqueeze(1), next_cache
+        fused = fused_step(
+            q[:, 0],
+            k[:, 0],
+            x[:, 0],
+            z[:, 0],
+            adt[:, 0],
+            dt[:, 0],
+            trap[:, 0],
+            angles[:, 0],
+            self.D,
+            cache,
+            mimo_x=self.mimo_x,
+            mimo_z=self.mimo_z,
+            mimo_out=self.mimo_out,
+        )
+        if fused is not None:
+            mixed, next_cache = fused
+            return self.out_proj(mixed.flatten(-2)).unsqueeze(1), next_cache
 
         phase_increment = torch.fmod(
             math.pi
@@ -514,6 +516,21 @@ class Mamba3(nn.Module):
         """Capture the complete stateful decode step for minimum CUDA latency."""
 
         return _CudaGraphDecoder(self, batch_size)
+
+    def compile(self, **kwargs: object) -> Mamba3:
+        """Replace ``forward`` with a ``torch.compile``-optimized version.
+
+        Inductor fuses the per-chunk elementwise chains of the scan (decay
+        construction, diagonal fold, gate, D term) and the phase
+        accumulation, leaving the tensor-core GEMMs to cuBLAS. The
+        recurrence is unchanged; precision-sensitive FP32 state and phase
+        handling are untouched. Pass ``torch.compile`` options (``dynamic``,
+        ``mode``, ...) as keyword arguments. Compilation happens lazily on
+        the first call; the returned module is this model.
+        """
+
+        self.forward = torch.compile(self.forward, **kwargs)  # type: ignore[method-assign]
+        return self
 
 
 class _CudaGraphDecoder:

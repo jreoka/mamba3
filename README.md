@@ -36,13 +36,18 @@ y = model(x)  # [2, 1024, 256]
 - `d_state=128`: SSM state width. `128` is the paper/checkpoint default.
 - `depth=4`: number of residual Mamba-3 mixers.
 - `mimo_rank=1`: canonical SISO. Use `4` for the stronger MIMO variant.
+- `causal=True`: forward-only recurrence. Set `causal=False` for a
+  bidirectional variant that runs every mixer scan in both temporal
+  directions with shared weights and blends them with a learned
+  per-channel logit (initialized at an exact 50/50 split).
 
-Input and output use `[batch, length, d_model]`. Mamba-3 is inherently causal.
-The class is a shape-preserving sequence backbone, so it can sit between any
-embedding and task head; it does not impose a tokenizer or vocabulary.
-The paper's language-model backbone additionally interleaves SwiGLU residual
-blocks and adds embedding/head layers. This mixer-only package intentionally
-leaves those choices to the caller.
+Input and output use `[batch, length, d_model]`. Mamba-3 is inherently causal;
+the bidirectional mode is for encoder-style tasks and does not support
+`prefill`/`step` decoding. The class is a shape-preserving sequence backbone,
+so it can sit between any embedding and task head; it does not impose a
+tokenizer or vocabulary. The paper's language-model backbone additionally
+interleaves SwiGLU residual blocks and adds embedding/head layers. This
+mixer-only package intentionally leaves those choices to the caller.
 
 For efficient training or prefill on BF16-capable NVIDIA GPUs, keep FP32 master
 parameters and use BF16 autocast:

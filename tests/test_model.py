@@ -35,6 +35,7 @@ def test_only_mamba3_is_public_and_constructor_is_small() -> None:
         "d_state",
         "depth",
         "mimo_rank",
+        "causal",
     ]
 
 
@@ -113,6 +114,51 @@ def test_causal_prefix_is_unchanged() -> None:
         y_first = model(first)
         y_second = model(second)
     torch.testing.assert_close(y_first[:, :7], y_second[:, :7], rtol=0, atol=1e-7)
+
+
+def test_bidirectional_is_non_causal_and_starts_at_50_50() -> None:
+    torch.manual_seed(11)
+    model = Mamba3(16, d_state=8, depth=1, causal=False).eval()
+    mixer = model.layers[0].mixer
+    assert not model.causal
+    assert not mixer.causal
+    torch.testing.assert_close(
+        mixer.direction_logit, torch.zeros_like(mixer.direction_logit)
+    )
+    first = torch.randn(1, 12, 16)
+    second = first.clone()
+    second[:, 5:] = torch.randn_like(second[:, 5:])
+    with torch.no_grad():
+        y_first = model(first)
+        y_second = model(second)
+    assert y_first.shape == first.shape
+    assert torch.isfinite(y_first).all()
+    # The first token depends on the future, so it must change with the tail.
+    assert not torch.allclose(y_first[:, 0], y_second[:, 0], rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.parametrize("rank", [1, 4])
+def test_bidirectional_backward_reaches_every_parameter(rank: int) -> None:
+    model = Mamba3(16, d_state=8, depth=2, mimo_rank=rank, causal=False)
+    x = torch.randn(2, 9, 16, requires_grad=True)
+    model(x).square().mean().backward()
+    assert x.grad is not None and torch.isfinite(x.grad).all()
+    assert all(
+        parameter.grad is not None and torch.isfinite(parameter.grad).all()
+        for parameter in model.parameters()
+    )
+    assert model.layers[0].mixer.direction_logit.grad is not None
+
+
+def test_bidirectional_rejects_caches_prefill_and_step() -> None:
+    model = Mamba3(16, d_state=8, depth=1, causal=False)
+    with pytest.raises(ValueError, match="causal"):
+        model.prefill(torch.randn(1, 4, 16))
+    with pytest.raises(ValueError, match="causal"):
+        model.step(torch.randn(1, 1, 16))
+    with pytest.raises(ValueError, match="causal"):
+        model.layers[0].mixer(torch.randn(1, 4, 16), return_cache=True)
+    assert model.layers[0].mixer.direction_logit is not None
 
 
 @pytest.mark.parametrize("rank", [1, 4])

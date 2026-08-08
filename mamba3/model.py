@@ -56,13 +56,25 @@ class _RMSNorm(nn.Module):
 
 
 class _Mamba3Mixer(nn.Module):
-    """Canonical Mamba-3 SISO/MIMO mixer with a chunked SSD backend."""
+    """Canonical Mamba-3 SISO/MIMO mixer with a chunked SSD backend.
 
-    def __init__(self, d_model: int, d_state: int, mimo_rank: int) -> None:
+    With ``causal=False`` the mixer additionally runs the scan on the
+    reversed sequence with the same weights and blends both directions
+    with a learned per-channel logit starting at exactly 50/50.
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        d_state: int,
+        mimo_rank: int,
+        causal: bool = True,
+    ) -> None:
         super().__init__()
         self.d_model = d_model
         self.d_state = d_state
         self.mimo_rank = mimo_rank
+        self.causal = causal
         self.d_inner = _EXPANSION * d_model
         # Preserve the canonical P=64 layout whenever possible while allowing
         # small feature sizes without adding configuration burden for users.
@@ -126,6 +138,11 @@ class _Mamba3Mixer(nn.Module):
             self.register_parameter("mimo_out", None)
 
         self.out_proj = nn.Linear(self.d_inner, d_model, bias=False)
+
+        if causal:
+            self.register_parameter("direction_logit", None)
+        else:
+            self.direction_logit = nn.Parameter(torch.zeros(d_model))
 
     def _split_projection(
         self, projected: torch.Tensor
@@ -257,6 +274,11 @@ class _Mamba3Mixer(nn.Module):
         *,
         return_cache: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, _LayerCache]:
+        if not self.causal and (cache is not None or return_cache):
+            raise ValueError(
+                "bidirectional Mamba3 does not support caches; "
+                "prefill and step require causal=True"
+            )
         q, k, x, z, adt, dt, trap, angles = self._project(hidden_states)
         initial_phase = cache[0] if cache is not None else None
         phase = self._phase(angles, dt, initial_phase)
@@ -286,23 +308,58 @@ class _Mamba3Mixer(nn.Module):
             k_bias=self.B_bias,
         )
         output = self.out_proj(mixed.flatten(-2))
-        if not return_cache:
-            return output
-        # Endpoint clones keep the cache storage constant in prefix length.
-        final_q, final_k = self._expand_qk(q[:, -1:], k[:, -1:])
-        _, final_k = rotate_qk(
-            final_q,
-            final_k,
-            phase[:, -1:],
-            mimo=self.mimo_rank > 1,
+        if self.causal:
+            if not return_cache:
+                return output
+            # Endpoint clones keep the cache storage constant in prefix length.
+            final_q, final_k = self._expand_qk(q[:, -1:], k[:, -1:])
+            _, final_k = rotate_qk(
+                final_q,
+                final_k,
+                phase[:, -1:],
+                mimo=self.mimo_rank > 1,
+            )
+            next_cache = (
+                phase[:, -1].clone(),
+                state,
+                final_k[:, 0].clone(),
+                x[:, -1].clone(),
+            )
+            return output, next_cache
+
+        # Bidirectional: re-run the shared mixer weights on the reversed
+        # sequence (fresh zero phase at the sequence end) and blend the two
+        # directions with a learned per-channel logit.
+        reversed_states = torch.flip(hidden_states, dims=(1,))
+        q_r, k_r, x_r, z_r, adt_r, dt_r, trap_r, angles_r = self._project(
+            reversed_states
         )
-        next_cache = (
-            phase[:, -1].clone(),
-            state,
-            final_k[:, 0].clone(),
-            x[:, -1].clone(),
+        phase_r = self._phase(angles_r, dt_r, None)
+        mixed_r, _ = mamba3_scan(
+            q_r,
+            k_r,
+            x_r,
+            z_r,
+            adt_r,
+            dt_r,
+            trap_r,
+            self.D,
+            mimo_x=self.mimo_x,
+            mimo_z=self.mimo_z,
+            mimo_out=self.mimo_out,
+            chunk_size=(
+                self.chunk_size
+                if self.training and torch.is_grad_enabled()
+                else self.inference_chunk_size
+            ),
+            phase=phase_r,
+            mimo_rotation=self.mimo_rank > 1,
+            q_bias=self.C_bias,
+            k_bias=self.B_bias,
         )
-        return output, next_cache
+        backward = self.out_proj(torch.flip(mixed_r, dims=(1,)).flatten(-2))
+        blend = torch.sigmoid(self.direction_logit).to(dtype=output.dtype)
+        return output * blend + backward * (1.0 - blend)
 
     def allocate_cache(
         self,
@@ -428,10 +485,16 @@ class _Mamba3Mixer(nn.Module):
 
 
 class _Mamba3Block(nn.Module):
-    def __init__(self, d_model: int, d_state: int, mimo_rank: int) -> None:
+    def __init__(
+        self,
+        d_model: int,
+        d_state: int,
+        mimo_rank: int,
+        causal: bool = True,
+    ) -> None:
         super().__init__()
         self.norm = _RMSNorm(d_model)
-        self.mixer = _Mamba3Mixer(d_model, d_state, mimo_rank)
+        self.mixer = _Mamba3Mixer(d_model, d_state, mimo_rank, causal=causal)
 
     def forward(
         self,
@@ -462,7 +525,10 @@ class Mamba3(nn.Module):
 
     The minimal form is ``Mamba3(d_model)``. Inputs and outputs both use
     ``[batch, length, d_model]``. Set ``mimo_rank=4`` for the paper's stronger
-    MIMO variant; the default rank of one is canonical SISO Mamba-3.
+    MIMO variant; the default rank of one is canonical SISO Mamba-3. Set
+    ``causal=False`` for a bidirectional variant that runs every mixer in
+    both temporal directions with shared weights and blends them with a
+    learned per-channel logit.
     """
 
     def __init__(
@@ -471,6 +537,7 @@ class Mamba3(nn.Module):
         d_state: int = 128,
         depth: int = 4,
         mimo_rank: int = 1,
+        causal: bool = True,
     ) -> None:
         super().__init__()
         if d_model <= 0:
@@ -488,8 +555,10 @@ class Mamba3(nn.Module):
         self.d_state = d_state
         self.depth = depth
         self.mimo_rank = mimo_rank
+        self.causal = causal
         self.layers = nn.ModuleList(
-            _Mamba3Block(d_model, d_state, mimo_rank) for _ in range(depth)
+            _Mamba3Block(d_model, d_state, mimo_rank, causal=causal)
+            for _ in range(depth)
         )
         self.norm_f = _RMSNorm(d_model)
 
@@ -526,6 +595,8 @@ class Mamba3(nn.Module):
     ) -> tuple[torch.Tensor, list[_LayerCache]]:
         """Process a causal prefix and return the constant-size decode cache."""
 
+        if not self.causal:
+            raise ValueError("prefill requires causal=True")
         self._validate_input(x)
         if x.shape[0] == 0 or x.shape[1] == 0:
             raise ValueError("prefill requires a non-empty batch and sequence")
@@ -542,6 +613,8 @@ class Mamba3(nn.Module):
     ) -> tuple[torch.Tensor, list[_LayerCache]]:
         """Process one token while carrying Mamba-3's four recurrent states."""
 
+        if not self.causal:
+            raise ValueError("step requires causal=True")
         self._validate_input(x, single_token=True)
         if cache is None:
             layer_caches: list[_LayerCache | None] = [None] * len(self.layers)

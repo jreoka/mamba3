@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import os
 
 import torch
 from torch import nn
@@ -22,6 +23,18 @@ _A_FLOOR = 1e-4
 # Phase accumulation is kept in smaller chunks than the scan: the unbounded
 # pre-fmod partial sums would otherwise lose FP32 precision at long context.
 _PHASE_CHUNK = 64
+def _default_chunk_sizes(mimo_rank: int) -> tuple[int, int]:
+    """Return training/inference chunk sizes tuned for modern NVIDIA GPUs.
+
+    Training pays O(L * chunk * rank^2) for the intra-chunk GEMMs, so the
+    smaller training chunk materially reduces FLOPs. Inference can use the
+    larger fused Triton chunk because it does not need the differentiable
+    PyTorch backward path.
+    """
+
+    training = 512 if mimo_rank == 1 else max(8, 64 // mimo_rank)
+    inference = 256 if mimo_rank == 1 else max(16, 128 // mimo_rank)
+    return training, inference
 
 _LayerCache = tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
 
@@ -57,11 +70,23 @@ class _Mamba3Mixer(nn.Module):
         self.nheads = self.d_inner // self.headdim
         self.ngroups = 1
         self.num_angles = int(d_state * _ROPE_FRACTION) // 2
-        # The chunked SSD is chunk-size invariant (each chunk carries the
-        # exact recurrence), so a large chunk is used to cut per-chunk kernel
-        # and graph overhead; MIMO is capped lower to bound the rank-expanded
-        # intra-chunk GEMM memory.
-        self.chunk_size = 256 if mimo_rank == 1 else max(16, 128 // mimo_rank)
+        # Training and inference want different chunk sizes. The differentiable
+        # PyTorch scan has intra-chunk GEMMs whose total work scales linearly
+        # with chunk width (and quadratically with MIMO rank), whereas the
+        # inference-only Triton path benefits from larger chunks. Keep an
+        # explicit override for reproducible tuning.
+        env_chunk = os.getenv("MAMBA3_CHUNK_SIZE")
+        train_chunk, inference_chunk = _default_chunk_sizes(mimo_rank)
+        if env_chunk:
+            try:
+                override_chunk = int(env_chunk)
+            except ValueError as error:
+                raise ValueError("MAMBA3_CHUNK_SIZE must be a positive integer") from error
+            if override_chunk <= 0:
+                raise ValueError("MAMBA3_CHUNK_SIZE must be a positive integer")
+            train_chunk = inference_chunk = override_chunk
+        self.chunk_size = train_chunk
+        self.inference_chunk_size = inference_chunk
 
         projection_size = (
             2 * self.d_inner
@@ -176,27 +201,42 @@ class _Mamba3Mixer(nn.Module):
         dt: torch.Tensor,
         initial_phase: torch.Tensor | None,
     ) -> torch.Tensor:
+        # Compute every 64-token local cumsum in one launch, then carry only
+        # the tiny per-chunk phase state sequentially. This preserves the
+        # original bounded-FP32 arithmetic exactly while removing one large
+        # cumsum launch and one large temporary per chunk.
         increments = (
             math.pi
             * torch.tanh(angles.float()).unsqueeze(2)
             * dt.unsqueeze(-1)
         )
         increments = torch.fmod(increments, 2.0 * math.pi)
+        batch, length, heads, angles_count = increments.shape
+        padding = (-length) % _PHASE_CHUNK
+        if padding:
+            increments = F.pad(increments, (0, 0, 0, 0, 0, padding))
+
+        chunk_count = increments.shape[1] // _PHASE_CHUNK
+        chunks = increments.reshape(
+            batch, chunk_count, _PHASE_CHUNK, heads, angles_count
+        )
+        local = torch.cumsum(chunks, dim=2)
         phase_state = (
-            torch.zeros_like(increments[:, 0])
+            torch.zeros_like(local[:, 0, 0])
             if initial_phase is None
             else initial_phase
         )
-        phase_chunks = []
-        for start in range(0, increments.shape[1], _PHASE_CHUNK):
-            chunk = increments[:, start : start + _PHASE_CHUNK]
-            current = torch.fmod(
-                torch.cumsum(chunk, dim=1) + phase_state.unsqueeze(1),
-                2.0 * math.pi,
+        offsets = []
+        for chunk_index in range(chunk_count):
+            offsets.append(phase_state)
+            phase_state = torch.fmod(
+                phase_state + local[:, chunk_index, -1], 2.0 * math.pi
             )
-            phase_chunks.append(current)
-            phase_state = current[:, -1]
-        return torch.cat(phase_chunks, dim=1)
+        phase_offsets = torch.stack(offsets, dim=1)
+        phase = torch.fmod(
+            local + phase_offsets.unsqueeze(2), 2.0 * math.pi
+        )
+        return phase.reshape(batch, -1, heads, angles_count)[:, :length]
 
     def _phase_and_rotate(
         self,
@@ -232,7 +272,11 @@ class _Mamba3Mixer(nn.Module):
             mimo_x=self.mimo_x,
             mimo_z=self.mimo_z,
             mimo_out=self.mimo_out,
-            chunk_size=self.chunk_size,
+            chunk_size=(
+                self.chunk_size
+                if self.training and torch.is_grad_enabled()
+                else self.inference_chunk_size
+            ),
             initial_state=cache[1] if cache is not None else None,
             initial_k=cache[2] if cache is not None else None,
             initial_value=cache[3] if cache is not None else None,
@@ -511,6 +555,44 @@ class Mamba3(nn.Module):
             x, updated = layer.step(x, layer_cache)
             next_cache.append(updated)
         return self.norm_f(x), next_cache
+
+    def set_chunk_sizes(
+        self,
+        *,
+        training: int | None = None,
+        inference: int | None = None,
+    ) -> Mamba3:
+        """Override scan chunk sizes without rebuilding the model.
+
+        Smaller chunks usually train faster because the differentiable
+        intra-chunk work scales with chunk width. Inference uses a separate
+        value because the Triton path has different launch/compute tradeoffs.
+        """
+
+        if training is not None and training <= 0:
+            raise ValueError("training chunk size must be positive")
+        if inference is not None and inference <= 0:
+            raise ValueError("inference chunk size must be positive")
+        for layer in self.layers:
+            if training is not None:
+                layer.mixer.chunk_size = training
+            if inference is not None:
+                layer.mixer.inference_chunk_size = inference
+        return self
+
+    def compile_layers(self, **kwargs: object) -> Mamba3:
+        """Compile each block separately instead of one giant model graph.
+
+        This is useful for long fixed-length training jobs: it keeps Inductor
+        graph size and peak compilation memory much smaller while still fusing
+        the elementwise work around the scan GEMMs. Compilation remains lazy.
+        """
+
+        for layer in self.layers:
+            layer.forward = torch.compile(  # type: ignore[method-assign]
+                layer.forward, **kwargs
+            )
+        return self
 
     def cuda_graph(self, batch_size: int = 1) -> _CudaGraphDecoder:
         """Capture the complete stateful decode step for minimum CUDA latency."""

@@ -663,6 +663,8 @@ def mamba3_scan(
         dim=1,
     )
     scale = gamma + next_endpoint
+    adt_float = adt.float()
+    scale_activation = scale.to(k.dtype)
     # The chunk states compose only when ``scale`` carries the next token's
     # left trapezoid endpoint; same-token outputs must see only gamma. Folding
     # the ratio into the decay diagonal below makes both true at once.
@@ -731,14 +733,14 @@ def mamba3_scan(
                 base_gate_chunk.unsqueeze(3)
                 * mimo_z_activation[None, :, None]
             )
-        adt_chunk = adt[:, start:end].permute(0, 2, 1).float()
-        scale_chunk = scale[:, start:end].permute(0, 2, 1)
+        adt_chunk = adt_float[:, start:end].permute(0, 2, 1)
+        scale_chunk = scale_activation[:, start:end].permute(0, 2, 1)
 
         cumulative = torch.cumsum(adt_chunk, dim=-1)
         prefix_decay = torch.exp(cumulative)
 
         q_flat = q_chunk.flatten(2, 3)
-        k_scaled = k_chunk * scale_chunk[..., None, None].to(k_chunk.dtype)
+        k_scaled = k_chunk * scale_chunk[..., None, None]
         k_flat = k_scaled.flatten(2, 3)
         value_flat = value_chunk.flatten(2, 3)
 

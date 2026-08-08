@@ -129,7 +129,6 @@ recurrence with FP32 state.
 ```bash
 pip install -e ".[dev]"
 pytest
-python benchmarks/benchmark_model.py
 ```
 
 ## License
